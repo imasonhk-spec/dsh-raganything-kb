@@ -2346,6 +2346,7 @@ window.__ModuleLoader__.load({
 					const base = parts[parts.length - 1] || d.id;
 					const m = /\.([A-Za-z0-9]+)$/.exec(base);
 					const ext = (m?.[1] ?? "md").toLowerCase();
+					if (ext === "md") continue;
 					const name = m && m[1] ? base.slice(0, -(m[1].length + 1)) : base;
 					const list = perDir.get(dir) ?? [];
 					list.push({
@@ -2361,7 +2362,7 @@ window.__ModuleLoader__.load({
 				return [...perDir.entries()].map(([dir, files]) => ({
 					dir,
 					files
-				})).sort((a, b) => (b.files.length - a.files.length) || a.dir.localeCompare(b.dir));
+				})).filter((g) => g.files.length > 0).sort((a, b) => (b.files.length - a.files.length) || a.dir.localeCompare(b.dir));
 			}, [productDocs]);
 			const folders = (0, react.useMemo)(() => {
 				const map = /* @__PURE__ */ new Map();
@@ -2861,7 +2862,8 @@ window.__ModuleLoader__.load({
 					const data = await ragWorkspaceFile(file.docId.slice(7));
 					setViewingDoc({
 						file,
-						content: data === null ? "无法读取工作区文件：RAG-Anything 无响应，或该文件为二进制格式（仅支持在 DSH 工作区中打开）。" : data.truncated ? `${data.content}\n\n…（文件较大，已截断显示前 200KB）` : data.content
+						content: data === null ? "无法读取工作区文件：RAG-Anything 无响应，或该文件为二进制格式（仅支持在 DSH 工作区中打开）。" : data.truncated ? `${data.content}\n\n…（文件较大，已截断显示前 200KB）` : data.content,
+						ofvUrl: ragWorkspaceDownloadUrl(file.docId.slice(7))
 					});
 					return;
 				}
@@ -2875,6 +2877,7 @@ window.__ModuleLoader__.load({
 								file,
 								content: raw,
 								originalUrl,
+								ofvUrl: originalUrl,
 								isOriginalText: true
 							});
 							return;
@@ -2889,7 +2892,8 @@ window.__ModuleLoader__.load({
 					else setViewingDoc({
 						file,
 						content: data.content,
-						originalUrl
+						originalUrl,
+						ofvUrl: originalUrl
 					});
 					return;
 				}
@@ -3110,7 +3114,7 @@ window.__ModuleLoader__.load({
 				if (fail > 0) showNotice(`${fail} 个文件上传失败（RAG-Anything 无响应或文件无效）。`);
 				await refresh();
 			};
-			const statusText = rag.kind === "checking" ? "RAG-Anything · 检测中…" : connected ? `RAG-Anything · 已连接 · ${docs.length} 篇文档` : "RAG-Anything · 未连接（演示数据）";
+			const statusText = rag.kind === "checking" ? "RAG-Anything · 检测中…" : connected ? `RAG-Anything · 已连接 · ${kbDocs.length} 篇文档` : "RAG-Anything · 未连接（演示数据）";
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
 				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 					className: clsx(KnowledgeBaseRoot_module_css_default.triggerRow, !wide && KnowledgeBaseRoot_module_css_default.railRow),
@@ -4072,7 +4076,7 @@ window.__ModuleLoader__.load({
 								] }),
 								/* @__PURE__ */ (0, react_jsx_runtime.jsx)(KbArtifactRail, {
 									groups: artifactGroups,
-									total: productDocs.length,
+									total: artifactGroups.reduce((n, g) => n + g.files.length, 0),
 									collapsed: artRailCollapsed,
 									onToggle: toggleArtRail,
 									onMention: mentionFile,
@@ -4184,10 +4188,7 @@ window.__ModuleLoader__.load({
 										children: [viewingDoc.originalUrl && !viewingDoc.isOriginalText && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 											className: KnowledgeBaseRoot_module_css_default.docViewerHint,
 											children: t("kb.originalHint")
-										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("pre", {
-											className: KnowledgeBaseRoot_module_css_default.docViewerContent,
-											children: viewingDoc.content
-										})]
+										}), /* @__PURE__ */ viewingDoc.ofvUrl ? (0, react_jsx_runtime.jsx)(OfvModalBody, { url: viewingDoc.ofvUrl, name: `${viewingDoc.file.name}.${viewingDoc.file.ext}`, fallback: viewingDoc.content }) : (0, react_jsx_runtime.jsx)("pre", { className: KnowledgeBaseRoot_module_css_default.docViewerContent, children: viewingDoc.content })]
 									})]
 								})
 							}),
@@ -5385,12 +5386,161 @@ window.__ModuleLoader__.load({
 			"kb.modelNoModels": "(no models available)"
 		};
 		//#endregion
-		//#region src/client/index.ts
+		//#region src/client/ofv.ts
+		/** Extensions rendered through the Open File Viewer bundle (window.__OFV__). */
+		const OFV_EXTS = "jpg jpeg jfif pjpe pjpeg png gif webp avif jxl svg bmp ico cur tif tiff apng heic heif dxf mp4 mpg mpeg mpe mpv webm ogv mov m4v avi mkv flv wmv 3gp 3g2 m2ts m3u8 mp3 wav aif aiff aifc ogg oga aac m4a flac opus weba amr mid midi caf au snd wma docx docm doc dotx dotm dot rtf odt fodt wps xlsx xls xlsm xlsb xlt xltx xltm csv tsv ods fods numbers et pptx pptm ppt pps ppsx ppsm potx potm odp fodp key dps zip rar 7z tar gz tgz bz2 xz eml msg mbox drawio dio excalidraw tldraw xmind epub dwg dwf step stp iges igs ifc sat sab x_t x_b 3dm skp sldprt sldasm gds gdsii oas oasis gltf glb obj stl fbx dae ply 3mf 3ds usd usda usdc usdz wrl vrml json txt md xml yaml yml js ts tsx jsx html css geojson topojson kml kmz gpx shp ttf otf woff woff2 eot psd psb ai eps ps webarchive sqlite sqlite3 db wasm parquet avro pdf".split(" ");
+		const OFV_ID = "openFileViewer";
+		/** In-flight <script> load of the self-contained OFV bundle. */
+		let ofvScriptPromise = null;
+		/** Load the OFV bundle once; resolves window.__OFV__ or rejects. */
+		function ensureOfv() {
+			if (window.__OFV__) return Promise.resolve(window.__OFV__);
+			if (!ofvScriptPromise) {
+				ofvScriptPromise = new Promise((resolve, reject) => {
+					const el = document.createElement("script");
+					el.src = `${ragBaseUrl()}/viewer/ofv.bundle.js`;
+					el.async = true;
+					el.onload = () => window.__OFV__ ? resolve(window.__OFV__) : (ofvScriptPromise = null, reject(new Error("ofv bundle evaluated without __OFV__")));
+					el.onerror = () => {
+						ofvScriptPromise = null;
+						reject(new Error("ofv bundle fetch failed"));
+					};
+					document.head.append(el);
+				});
+			}
+			return ofvScriptPromise;
+		}
+		/** Configure pdf.js asset paths, then mount one source into `container`. */
+		async function ofvMount(container, source, fileName, extra) {
+			const ofv = await ensureOfv();
+			ofv.assetBase(`${ragBaseUrl()}/viewer`);
+			return ofv.mount(container, {
+				file: source,
+				fileName,
+				locale: "zh-CN",
+				...extra
+			});
+		}
+		/** Filename for extension detection out of a resource address or explicit name. */
+		function ofvFileNameOf(address, fallback) {
+			if (fallback) return fallback;
+			try {
+				return String(address || "").split(/[?#]/)[0].split("/").pop() || "file";
+			} catch {
+				return "file";
+			}
+		}
+		/** Right-sidebar document body: render host bytes with Open File Viewer. */
+		function OfvDocBody(props) {
+			const { content, resourceAddress } = props;
+			const hostRef = react.useRef(null);
+			const fileName = react.useMemo(() => ofvFileNameOf(resourceAddress), [resourceAddress]);
+			const hasBytes = !!content && content.kind === "bytes" && !!content.data;
+			react.useEffect(() => {
+				const el = hostRef.current;
+				if (!el || !hasBytes) return;
+				let destroyed = false;
+				let viewer = null;
+				ofvMount(el, new Blob([content.data]), fileName).then((v) => {
+					if (destroyed) {
+						try {
+							v.destroy();
+						} catch {}
+						return;
+					}
+					viewer = v;
+				}).catch(() => {
+					if (!destroyed) el.textContent = "Open File Viewer 加载失败，请重试或下载文件查看。";
+				});
+				return () => {
+					destroyed = true;
+					try {
+						if (viewer) viewer.destroy();
+					} catch {}
+				};
+			}, [content, fileName, hasBytes]);
+			if (!hasBytes) return (0, react_jsx_runtime.jsx)("p", {
+				style: {
+					padding: 16
+				},
+				children: "正在加载文件…"
+			});
+			return (0, react_jsx_runtime.jsx)("div", {
+				ref: hostRef,
+				style: {
+					height: "100%",
+					minHeight: 480
+				}
+			});
+		}
+		/** KB-panel modal body: render the original file by sidecar URL, fall back to extracted text. */
+		function OfvModalBody(props) {
+			const { url, name, fallback } = props;
+			const hostRef = react.useRef(null);
+			const [failed, setFailed] = react.useState(false);
+			react.useEffect(() => {
+				const el = hostRef.current;
+				if (!el || failed || !url) return;
+				let destroyed = false;
+				let viewer = null;
+				ofvMount(el, url, name, {
+					onError: () => setFailed(true),
+					onUnsupported: () => setFailed(true)
+				}).then((v) => {
+					if (destroyed) {
+						try {
+							v.destroy();
+						} catch {}
+						return;
+					}
+					viewer = v;
+				}).catch(() => {
+					if (!destroyed) setFailed(true);
+				});
+				return () => {
+					destroyed = true;
+					try {
+						if (viewer) viewer.destroy();
+					} catch {}
+				};
+			}, [url, name, failed]);
+			if (failed || !url) return (0, react_jsx_runtime.jsx)("pre", {
+				className: KnowledgeBaseRoot_module_css_default.docViewerContent,
+				children: fallback ?? ""
+			});
+			return (0, react_jsx_runtime.jsx)("div", {
+				ref: hostRef,
+				style: {
+					flex: 1,
+					minHeight: 0
+				}
+			});
+		}
+		/** Register Open File Viewer as the highest-priority document preview. */
+		function registerOfvPreview(ctx) {
+			if (!ctx.documentPreviews || !ctx.slots) return;
+			ctx.effect(() => ctx.documentPreviews.register({
+				id: OFV_ID,
+				extensions: OFV_EXTS,
+				priority: "extension",
+				title: () => "Open File Viewer",
+				loading: "bytes-complete",
+				wrap: false
+			}), "dsh-raganything-kb: ofv preview registry");
+			ctx.effect(() => ctx.slots.inject("sidebar.right.tab.document", () => ctx.slots.register({
+				name: "sidebar.right.tab.document",
+				key: OFV_ID,
+				locale: NS
+			}, OfvDocBody)), "dsh-raganything-kb: ofv preview slot");
+		}
+		//#endregion
+				//#region src/client/index.ts
 		/** Dictionary namespace owned by this plugin (KB panel copy). */
 		const NS = "raganything";
 		/** Services required (cordis fiber inject). */
 		const inject = [
 			"slots",
+			"documentPreviews",
 			"locale",
 			"remote",
 			"remote.session"
@@ -5416,6 +5566,7 @@ window.__ModuleLoader__.load({
 				locale: NS,
 				inject: kbInjected
 			}, KnowledgeBaseRoot));
+			registerOfvPreview(ctx);
 		}
 		//#endregion
 		exports.apply = apply;

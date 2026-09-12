@@ -1,6 +1,6 @@
 {
   "name": "dsh-raganything-kb",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "RAG-Anything (HKUDS) multimodal RAG knowledge base for DeepSeek Harness: install on any DSH host to get a fresh, empty, fully independent knowledge base with rag_* model tools and the in-DSH 知识库 UI (sidebar entry directly above Settings). No knowledge base data is bundled — each host builds its own.",
   "type": "module",
   "main": "lib/index.js",

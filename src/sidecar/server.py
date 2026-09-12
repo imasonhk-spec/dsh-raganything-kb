@@ -575,6 +575,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------------
+# Open File Viewer static assets (/viewer/*): the browser bundle of
+# @open-file-viewer/core served next to the API so the KB panel and the DSH
+# document sidebar can load it same-origin (via /rag) or directly.
+# ---------------------------------------------------------------------------
+
+VIEWER_DIR = Path(__file__).resolve().parent / "viewer"
+
+if VIEWER_DIR.is_dir():
+    from starlette.staticfiles import StaticFiles
+
+    app.mount("/viewer", StaticFiles(directory=str(VIEWER_DIR)), name="viewer")
+
 # Optional access token for shared/remote deployments. When set (via the
 # RAG_SIDECAR_TOKEN environment variable or a "token" key in the config
 # file), every endpoint except GET /health requires it as
@@ -588,7 +601,7 @@ if SIDECAR_TOKEN:
     async def _require_token(request: Request, call_next):
         # CORS preflight and the liveness probe stay open so monitoring and
         # browsers can always reach them.
-        if request.method == "OPTIONS" or request.url.path == "/health":
+        if request.method == "OPTIONS" or request.url.path == "/health" or request.url.path.startswith("/viewer/"):
             return await call_next(request)
         auth = request.headers.get("authorization", "") or ""
         provided = (
