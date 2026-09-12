@@ -1,1 +1,72 @@
 # dsh-raganything-kb
+
+DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主插件 + DSH 内嵌前端面板 + Python sidecar**。
+
+装好之后，DSH 侧边栏会多出一个「知识库」入口：上传资料 → 自动解析入库 → 检索问答，
+还能把问答产物导出成 Office 文档。
+
+---
+
+## 组成
+
+| 位置 | 文件 | 职责 |
+| --- | --- | --- |
+| 宿主插件 | `src/lib/index.js` | 向 DSH 注册 6 个 `rag_*` 工具；托管 sidecar 进程（健康检查优先 adopt，缺服务才 spawn） |
+| 前端面板 | `src/lib/client.js` | 侧边栏入口 + 全屏知识库 UI：目录树 / 检索 / 问答 / 历史 / 上传 / AI 模型 / 索引管理 / 日志 / 导出 / **对话产物栏** |
+| sidecar | `src/sidecar/server.py` | LightRAG 检索与入库、MinerU 解析（PDF / Office / 图片）、本地 bge-m3 GGUF 向量、四路去重、工作区同步、失败台账 |
+| 配置模板 | `src/kb/config.json.template` | 零配置安装时的 sidecar 配置基线 |
+| 插件声明 | `src/cordis.patch.yml` | DSH 插件元数据 |
+| 安装骨架 | `packaging/` | 幂等安装器 / 验证器 / 卸载器 + systemd · nginx · env 模板 + 配置适配脚本 |
+| 打包工具 | `build/` | 从 live 插件目录快照出「可移植包」；把补丁函数级移植到**已分叉**的部署 |
+
+## 主要能力
+
+- **多模态入库**：PDF / Office / 图片经 MinerU 解析后入 LightRAG
+- **本地向量**：bge-m3 GGUF（1024 维），运行时自举 `llama-cpp-python` + 模型自动下载（走 hf-mirror）
+- **四路重复检测**：同名 / 同 SHA-256 同名 / 同 SHA-256 跨名 / 图片 pHash，策略可配
+- **失败台账**：错误分类 + 重试收割 + 额度熔断（额度不足时不再无限重试）
+- **产物导出**：问答结果导出 docx / xlsx / pptx
+- **多用户隔离**：localStorage 按账号加命名空间（`dsh_mu_user`）；sidecar 基址跟随网关 basePath；每个账户自启自己的 sidecar
+- **「对话产物」栏**：会话产物按会话分组展示在对话框右侧，可折叠，每项一个 `@文件` 按钮把产物作为引用注入当前对话
+
+## 分支与打补丁须知（重要）
+
+同一份代码已在多套部署上**分叉**，各自带着对方没有的特性：
+
+| 分支 | 特征 |
+| --- | --- |
+| 基准 | 纯插件代码 |
+| 多用户网关分支 | 基准 + 多用户隔离（`MU_NS` 命名空间、网关 basePath） |
+| 单机分支 | 基准 + 面板崩溃防护（`normaliseModelsSnap`） |
+
+**给已分叉的部署打补丁，不要整文件覆盖** —— 用函数级锚点替换，并且每处都断言命中次数
+（见 `build/kb_artifact_rail_patch.py`、`build/apply_norm_fix.py`）。整文件覆盖会把对方独有的
+功能静默冲掉。
+
+## 版本
+
+| 版本 | 内容 |
+| --- | --- |
+| **0.3.7** | 「对话产物」栏；产物文件夹从知识库树下线；全局检索恒定排除产物；面板崩溃防护；打包缺陷修复（`uninstall.sh` 的 CRLF、误打进包里的 `__pycache__`） |
+| 0.3.6 | 多用户数据隔离；「删除后重传仍报重复」修复（A–G 七处）；`install.sh --no-pnpm` 解析器修复 |
+| 0.3.5 | 基线 |
+
+发布说明见 [`docs/RELEASE-0.3.7.md`](docs/RELEASE-0.3.7.md)。
+
+## 安装（可移植包）
+
+可移植包由 `build/build_pkg037.py` 从 **live 插件目录**快照生成，内含安装器 + 载荷 + 校验清单：
+
+```bash
+tar xzf dsh-raganything-kb-0.3.7-portable.tar.gz
+cd dsh-raganything-kb-0.3.7-portable
+SUDO_PW='<sudo 密码>' ./install.sh --profile web   # 以 DSH 属主用户运行，不要用 root
+./verify.sh --profile web --deep                   # --deep 会真的提交一次查询验证整条链路
+```
+
+安装器是**幂等**的：**升级直接重跑 `install.sh`，不要先卸载**（卸载会删插件目录）。
+每一步都会留 `.bak-*` 备份，旧版本也会存一份到 `~/.dsh/raganything/backup-portable-<时间戳>/`。
+
+---
+
+内部项目，未附许可证。

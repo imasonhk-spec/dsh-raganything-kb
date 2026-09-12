@@ -1,0 +1,12 @@
+# build artefacts — never committed
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+*.log
+*.tgz
+dist/
+
+# local scratch
+tmp_*
+.repo_push/
