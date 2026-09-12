@@ -12,7 +12,7 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 | 位置 | 文件 | 职责 |
 | --- | --- | --- |
 | 宿主插件 | `src/lib/index.js` | 向 DSH 注册 6 个 `rag_*` 工具；托管 sidecar 进程（健康检查优先 adopt，缺服务才 spawn） |
-| 前端面板 | `src/lib/client.js` | 侧边栏入口 + 全屏知识库 UI：目录树 / 检索 / 问答 / 历史 / 上传 / AI 模型 / 索引管理 / 日志 / 导出 / **对话产物栏** |
+| 前端面板 | `src/lib/client.js` | 侧边栏入口 + 全屏知识库 UI：目录树 / 检索 / 问答 / 历史 / 上传 / AI 模型 / 索引管理 / 日志 / 导出 / **对话产物栏**。面板内所有文档计数统一走 `kbDocs` 口径（排除只读 `DSH产物/` 镜像与 `知识库产物/` 产物），状态栏与「索引」弹窗数字一致 |
 | sidecar | `src/sidecar/server.py` | LightRAG 检索与入库、MinerU 解析（PDF / Office / 图片）、本地 bge-m3 GGUF 向量、四路去重、工作区同步、失败台账 |
 | 配置模板 | `src/kb/config.json.template` | 零配置安装时的 sidecar 配置基线 |
 | 插件声明 | `src/cordis.patch.yml` | DSH 插件元数据 |
@@ -47,19 +47,21 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 
 | 版本 | 内容 |
 | --- | --- |
-| **0.3.7** | 「对话产物」栏；产物文件夹从知识库树下线；全局检索恒定排除产物；面板崩溃防护；打包缺陷修复（`uninstall.sh` 的 CRLF、误打进包里的 `__pycache__`） |
+| **0.3.9** | 「索引」弹窗计数口径修复：`extDist` 遍历 `kbDocs` 而非全部 `docs`，弹窗数字与侧栏状态栏、目录树三者一致（此前状态栏 9、弹窗 455） |
+| 0.3.8 | 状态栏计数对齐目录树（`kbDocs.length`）；「对话产物」栏只列生成文件（跳过对话 `.md`）；`server.py` 增加 OFV `/viewer/*` 静态挂载 |
+| 0.3.7 | 「对话产物」栏；产物文件夹从知识库树下线；全局检索恒定排除产物；面板崩溃防护；打包缺陷修复（`uninstall.sh` 的 CRLF、误打进包里的 `__pycache__`） |
 | 0.3.6 | 多用户数据隔离；「删除后重传仍报重复」修复（A–G 七处）；`install.sh --no-pnpm` 解析器修复 |
 | 0.3.5 | 基线 |
 
-发布说明见 [`docs/RELEASE-0.3.7.md`](docs/RELEASE-0.3.7.md)。
+发布说明见 [`docs/RELEASE-0.3.9.md`](docs/RELEASE-0.3.9.md)（历史：[0.3.8](docs/RELEASE-0.3.8.md) · [0.3.7](docs/RELEASE-0.3.7.md)）。
 
 ## 安装（可移植包）
 
-可移植包由 `build/build_pkg037.py` 从 **live 插件目录**快照生成，内含安装器 + 载荷 + 校验清单：
+可移植包由 `build/build_pkg039.py` 从 **live 插件目录**快照生成，内含安装器 + 载荷 + 校验清单：
 
 ```bash
-tar xzf dsh-raganything-kb-0.3.7-portable.tar.gz
-cd dsh-raganything-kb-0.3.7-portable
+tar xzf dsh-raganything-kb-0.3.9-portable.tar.gz
+cd dsh-raganything-kb-0.3.9-portable
 SUDO_PW='<sudo 密码>' ./install.sh --profile web   # 以 DSH 属主用户运行，不要用 root
 ./verify.sh --profile web --deep                   # --deep 会真的提交一次查询验证整条链路
 ```

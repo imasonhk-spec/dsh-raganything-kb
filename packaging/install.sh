@@ -20,7 +20,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_NAME="dsh-raganything-kb"
-PKG_VERSION="0.3.7"
+PKG_VERSION="0.3.9"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 # ---------------------------------------------------------------- defaults --

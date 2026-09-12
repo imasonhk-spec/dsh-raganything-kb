@@ -6,11 +6,12 @@
 
 | 脚本 | 作用 |
 | --- | --- |
-| `build_pkg037.py` | **当前版本的打包器**。取上一版的包装骨架（安装器/验证器/卸载器/extras/tools），刷新载荷为 live 插件目录的快照，套用移植补丁，重建 `manifest.json`，打 `plugin/*.tgz` 与便携包，并跑一遍静态校验 + 沙箱安装演练 |
-| `build_pkg036.py` | 上一版打包器，保留作对照（它按 stdout 而非退出码判断 `bash -n`，因此漏掉了 `uninstall.sh` 的 CRLF 缺陷） |
-| `run_build037.py` | 把上面两个脚本投到目标主机执行，并把产物拉回本地 `dist/` |
+| `build_pkg039.py` | **当前版本的打包器**。取上一版的包装骨架（安装器/验证器/卸载器/extras/tools），刷新载荷为 live 插件目录的快照，套用移植补丁，重建 `manifest.json`，打 `plugin/*.tgz` 与便携包，并跑一遍静态校验 + 沙箱安装演练 |
+| `build_pkg037.py` / `build_pkg036.py` | 上一版打包器，保留作对照（`build_pkg036` 按 stdout 而非退出码判断 `bash -n`，因此漏掉了 `uninstall.sh` 的 CRLF 缺陷） |
+| `run_build039.py` | 把构建器与补丁器投到目标主机执行，并把产物拉回本地 `dist/` |
 
-`build_pkg037.py` 的 9 个步骤：骨架拷贝 → 刷新载荷 → 移植崩溃防护 → 载荷标记断言 →
+`build_pkg039.py` 的 9 个步骤：骨架拷贝 → 刷新载荷 → 移植崩溃防护 → 状态栏计数修复 →
+索引弹窗计数修复 → 载荷标记断言 →
 版本号 → README → 打 tgz → 重建 manifest → 打便携包 → 静态校验 → **沙箱安装演练**。
 
 > **沙箱演练原理**：`install.sh` 用 `RUN_HOME="${HOME}"`（只有 root 才走 `getent`），
@@ -22,6 +23,8 @@
 | 脚本 | 作用 |
 | --- | --- |
 | `apply_norm_fix.py` | 把面板崩溃防护 `normaliseModelsSnap` 函数级移植到缺少它的分支（逐字节同一段代码，锚点唯一性断言） |
+| `apply_count_rail_fix.py` | 把「状态栏计数口径 + 对话产物栏 md 过滤」补丁打到带产物栏的分支（锚点计数断言 + 幂等） |
+| `apply_extdist_fix.py` | 把「索引弹窗计数口径」补丁打到带产物栏的分支：`extDist` 由遍历 `docs` 改为 `kbDocs`，依赖数组 `[docs]`→`[kbDocs]`（锚点计数断言 + 幂等） |
 | `kb_artifact_rail_patch.py` | 「对话产物」栏 + 产物文件夹下线的完整补丁集（前端布局、产物栏组件、sidecar 检索排除） |
 | `deploy_artrail.py` | 把上面这份补丁分别部署到三套部署（含各账户副本），带时间戳备份并重启 DSH |
 

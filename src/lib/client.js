@@ -2315,10 +2315,10 @@ window.__ModuleLoader__.load({
 			/** Product docs (知识库产物/…) surface only under the pinned mirror node. */
 			const productDocs = (0, react.useMemo)(() => docs.filter((d) => (d.title || "").replace(/\\/g, "/").startsWith(`${PIN_KB}/`)), [docs]);
 			const kbDocs = (0, react.useMemo)(() => docs.filter((d) => !isPinnedPrefix((d.title || "").replace(/\\/g, "/"))), [docs]);
-			/** File-type distribution across all ingested docs (索引 modal bar). */
+			/** File-type distribution across KB docs (索引 modal bar). Mirrors (DSH产物/) and artifacts (知识库产物/) are excluded so this count matches the sidebar status and the KB tree. */
 			const extDist = (0, react.useMemo)(() => {
 				const counts = /* @__PURE__ */ new Map();
-				for (const d of docs) {
+				for (const d of kbDocs) {
 					const base = (d.title || d.id || "").replace(/\\/g, "/");
 					const ext = (/\.([A-Za-z0-9]+)$/.exec(base)?.[1] ?? "txt").toUpperCase();
 					counts.set(ext, (counts.get(ext) ?? 0) + 1);
@@ -2330,7 +2330,7 @@ window.__ModuleLoader__.load({
 					pct: n / total * 100,
 					color: IDX_COLORS[i % IDX_COLORS.length]
 				}));
-			}, [docs]);
+			}, [kbDocs]);
 			const realFolders = connected ? groupDocsIntoFolders(kbDocs) : rag.kind === "offline" ? DEMO_FOLDERS : [];
 			/**
 			* 对话产物（问答导出为 Word/Excel/PPT/Markdown）按会话分组，供对话框
