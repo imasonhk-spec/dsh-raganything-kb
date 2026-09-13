@@ -5310,6 +5310,605 @@ def _ingest_active() -> int:
                if t["op"].startswith("ingest") and t["status"] in ("pending", "running"))
 
 
+
+# ---------------------------------------------------------------------------
+# 共享知识库（2026-09-13）
+# 设计：多用户部署里以宿主实例（默认 http://127.0.0.1:17321）为共享存储——
+#   · 共享文档以 display_path 前缀 "共享/<文件夹>/" 入库到宿主实例；
+#   · 文件夹与成员清单（谁可查看）记录在宿主 config 同目录 shared_kb.json；
+#   · 用户实例的 /shared/* 全部转发到宿主（自动读取宿主 token）。
+# 单实例部署（PORT==17321）自动进入本地模式，功能照常可用。
+# ---------------------------------------------------------------------------
+SHARED_NS = "共享"
+SHARED_BASE = (os.environ.get("RAG_SHARED_BASE") or "http://127.0.0.1:17321").rstrip("/")
+
+
+def _shared_is_local() -> bool:
+    """本实例自己就是共享存储宿主。"""
+    if SHARED_BASE == "local":
+        return True
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(SHARED_BASE)
+        host = u.hostname or "127.0.0.1"
+        return host in ("127.0.0.1", "localhost", "::1") and (u.port or 80) == PORT
+    except Exception:
+        return False
+
+
+def _mu_host_home() -> Path:
+    """multi-user 部署里 dsh-web 宿主的家目录（读宿主 token / 账号清单用）。"""
+    if _DSH_HOME_ENV:
+        parts = Path(_DSH_HOME_ENV).resolve().parts
+        if ".dsh" in parts:
+            i = parts.index(".dsh")
+            return Path(*parts[:i]) if i > 0 else Path("/")
+    return Path.home()
+
+
+_SHARED_TOK_CACHE = {"ts": 0.0, "token": ""}
+
+
+def _shared_token() -> str:
+    tok = os.environ.get("RAG_SHARED_TOKEN", "").strip()
+    if tok:
+        return tok
+    now = time.time()
+    if now - _SHARED_TOK_CACHE["ts"] < 10:
+        return _SHARED_TOK_CACHE["token"]
+    tok = ""
+    cfg_path = os.environ.get("RAG_SHARED_CONFIG") or str(_mu_host_home() / ".dsh" / "raganything" / "config.json")
+    try:
+        tok = str(json.loads(Path(cfg_path).read_text(encoding="utf-8")).get("token") or "")
+    except Exception:
+        tok = ""
+    _SHARED_TOK_CACHE["ts"] = now
+    _SHARED_TOK_CACHE["token"] = tok
+    return tok
+
+
+def _shared_account(explicit: str | None = None) -> str:
+    """当前账号：客户端显式传入 > DSH_HOME 推导 > 宿主用户名。"""
+    e = (explicit or "").strip()
+    if e:
+        return e
+    if _DSH_HOME_ENV:
+        parts = Path(_DSH_HOME_ENV).resolve().parts
+        if "users" in parts:
+            try:
+                return parts[parts.index("users") + 1]
+            except IndexError:
+                pass
+    return _mu_host_home().name or "admin"
+
+
+def _shared_manifest_path() -> Path:
+    return Path(CONFIG_PATH).parent / "shared_kb.json"
+
+
+def _shared_manifest() -> dict:
+    try:
+        data = json.loads(_shared_manifest_path().read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if not isinstance(data.get("folders"), list):
+        data["folders"] = []
+    return data
+
+
+def _shared_manifest_save(data: dict) -> None:
+    p = _shared_manifest_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    tmp.replace(p)
+
+
+def _shared_mu_account_db() -> tuple[list[str], set[str]]:
+    """(有效用户, 管理员集合)：users.json 为权威来源（已删除/停用账号不可选）。"""
+    mu_root = _mu_host_home() / ".dsh" / "multi-user"
+    valid: list[str] = []
+    admins: set[str] = set()
+    try:
+        uj = json.loads((mu_root / "users.json").read_text(encoding="utf-8"))
+        for u in uj.get("users") or []:
+            if not isinstance(u, dict):
+                continue
+            name = str(u.get("username") or "").strip()
+            if not name:
+                continue
+            if str(u.get("status") or "active") == "active":
+                valid.append(name)
+            if str(u.get("role") or "") == "admin":
+                admins.add(name)
+    except Exception:
+        valid = []
+    if not valid:
+        # users.json 缺失时退回目录列表（旧行为）
+        try:
+            uroot = mu_root / "users"
+            if uroot.is_dir():
+                valid = sorted(d.name for d in uroot.iterdir() if d.is_dir())
+        except Exception:
+            valid = []
+    return valid, admins
+
+
+def _shared_known_users() -> list[str]:
+    valid, _admins = _shared_mu_account_db()
+    host = _mu_host_home().name or "admin"
+    if host not in valid:
+        valid = [host] + valid
+    return sorted(set(valid))
+
+
+def _shared_is_admin(acct: str) -> bool:
+    """宿主用户与 users.json 里 role=admin 的账号视为管理员。"""
+    if acct == (_mu_host_home().name or "admin"):
+        return True
+    _valid, admins = _shared_mu_account_db()
+    return acct in admins
+
+
+def _shared_folder_visible(folder: dict, user: str) -> bool:
+    return user == (folder.get("created_by") or "") or user in (folder.get("members") or [])
+
+
+async def _shared_forward(method: str, path: str, *, params=None, json_body=None,
+                          files=None, data=None, raw: bool = False):
+    headers = {}
+    tok = _shared_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    async with httpx.AsyncClient(timeout=120.0) as hc:
+        r = await hc.request(method, SHARED_BASE + path, params=params, json=json_body,
+                             files=files, data=data, headers=headers)
+    if raw:
+        return Response(content=r.content, status_code=r.status_code,
+                        media_type=r.headers.get("content-type", "application/octet-stream"))
+    if r.status_code >= 400:
+        try:
+            detail = r.json().get("detail", r.text)
+        except Exception:
+            detail = r.text
+        raise HTTPException(status_code=r.status_code, detail=str(detail))
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
+async def _shared_local_docs() -> list[dict]:
+    """宿主本地：收集 display_path 以 共享/ 开头的全部文档（轻量版 /documents）。"""
+    rag = await ensure_rag()
+    from lightrag.base import DocStatus
+    statuses = (DocStatus.PROCESSED, DocStatus.PROCESSING, DocStatus.PENDING,
+                DocStatus.FAILED, DocStatus.PREPROCESSED)
+    results = await asyncio.gather(*[rag.lightrag.get_docs_by_status(s) for s in statuses])
+    out: list[dict] = []
+    for status_, mapping in zip(statuses, results):
+        for doc_id, doc in mapping.items():
+            title = str(getattr(doc, "file_path", "") or "").replace("\\", "/")
+            if not title.startswith(SHARED_NS + "/"):
+                continue
+            out.append({
+                "doc_id": doc_id,
+                "title": title,
+                "status": status_.value,
+                "has_file": _original_file_of(title) is not None,
+                "content_length": getattr(doc, "content_length", None),
+            })
+    for task_id, info in _state["processing_entries"].items():
+        title = str(info.get("title") or "").replace("\\", "/")
+        if title.startswith(SHARED_NS + "/"):
+            out.append({"doc_id": f"task-{task_id}", "title": title, "status": "processing",
+                        "has_file": True, "content_length": None})
+    out.sort(key=lambda d: str(d["title"]))
+    return out
+
+
+@app.get("/shared/tree")
+async def shared_tree(user: str | None = None):
+    if not _shared_is_local():
+        return await _shared_forward("GET", "/shared/tree", params={"user": user or ""})
+    acct = _shared_account(user)
+    data = _shared_manifest()
+    docs = await _shared_local_docs()
+    # 回收箱中的文档不在树中展示
+    trashed_ids = {str(x) for t in (data.get("trash") or []) for x in (t.get("doc_ids") or [])}
+    if trashed_ids:
+        docs = [d for d in docs if str(d["doc_id"]) not in trashed_ids]
+    host_admin = _shared_is_admin(acct)
+    # 每个文档归属"最长匹配"的文件夹条目，避免父子条目重复列出同一文档
+    names = sorted((str(f.get("name") or "") for f in data["folders"]), key=len, reverse=True)
+
+    def _owner_of(title: str) -> str | None:
+        for n in names:
+            if n and title.startswith(f"{SHARED_NS}/{n}/"):
+                return n
+        return None
+
+    by_owner: dict[str, list[dict]] = {}
+    for d in docs:
+        owner = _owner_of(str(d["title"]))
+        if owner:
+            by_owner.setdefault(owner, []).append(d)
+    folders = []
+    for f in data["folders"]:
+        fname = str(f.get("name") or "")
+        if not _shared_folder_visible(f, acct) and not host_admin:
+            continue
+        renames = f.get("renames") or {}
+        fd = []
+        for d in by_owner.get(fname, []):
+            dd = dict(d)
+            rn = renames.get(str(dd["doc_id"]))
+            if rn:
+                dd["title"] = f"{SHARED_NS}/{fname}/{rn}"
+            fd.append(dd)
+        folders.append({
+            "name": fname,
+            "display": f.get("alias") or fname,
+            "members": f.get("members") or [],
+            "created_by": f.get("created_by") or "",
+            "docs": fd,
+            "can_manage": acct == (f.get("created_by") or "") or host_admin,
+        })
+    folders.sort(key=lambda x: x["name"])
+    return {"folders": folders, "users": _shared_known_users(), "account": acct, "is_admin": host_admin}
+
+
+@app.post("/shared/folders")
+async def shared_folder_create(request: Request):
+    body = await request.json()
+    if not _shared_is_local():
+        return await _shared_forward("POST", "/shared/folders", json_body=body)
+    name = str(body.get("name") or "").strip().strip("/")
+    user = _shared_account(body.get("user"))
+    if not name or len(name) > 80 or "\\" in name or any(s in (".", "..") for s in name.split("/")):
+        raise HTTPException(status_code=400, detail="invalid folder name")
+    data = _shared_manifest()
+    if any(f.get("name") == name for f in data["folders"]):
+        raise HTTPException(status_code=409, detail="共享文件夹已存在")
+    members = sorted({str(m).strip() for m in (body.get("members") or []) if str(m).strip()} | {user})
+    data["folders"].append({
+        "name": name,
+        "members": members,
+        "created_by": user,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _shared_manifest_save(data)
+    return {"ok": True, "name": name}
+
+
+@app.put("/shared/folders/{name}")
+async def shared_folder_update(name: str, request: Request):
+    body = await request.json()
+    return await _shared_folder_manage(name, body)
+
+
+@app.put("/shared/folders")
+async def shared_folder_update_q(request: Request):
+    """嵌套名（含 /）的成员/别名更新：name 走 body。"""
+    body = await request.json()
+    name = str(body.get("name") or "").strip().strip("/")
+    return await _shared_folder_manage(name, body)
+
+
+async def _shared_folder_manage(name: str, body: dict):
+    if not _shared_is_local():
+        return await _shared_forward("PUT", "/shared/folders", json_body={**body, "name": name})
+    user = _shared_account(body.get("user"))
+    data = _shared_manifest()
+    f = next((x for x in data["folders"] if x.get("name") == name), None)
+    if f is None:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    if user != (f.get("created_by") or "") and not _shared_is_admin(user):
+        raise HTTPException(status_code=403, detail="只有创建者可以管理")
+    if "alias" in body:
+        alias = str(body.get("alias") or "").strip().strip("/")
+        if not alias or len(alias) > 80 or "\\" in alias:
+            raise HTTPException(status_code=400, detail="invalid alias")
+        f["alias"] = alias
+    if "members" in body:
+        members = sorted({str(m).strip() for m in (body.get("members") or []) if str(m).strip()} | {f.get("created_by") or user})
+        f["members"] = members
+    _shared_manifest_save(data)
+    return {"ok": True, "members": f.get("members") or [], "alias": f.get("alias") or name}
+
+
+@app.delete("/shared/folders/{name}")
+async def shared_folder_delete(name: str, user: str | None = None):
+    return await _shared_folder_trash(name, user)
+
+
+@app.delete("/shared/folders")
+async def shared_folder_delete_q(name: str = "", user: str | None = None):
+    """嵌套名（含 /）的文件夹删除（入回收箱）：name 走 query。"""
+    return await _shared_folder_trash(name, user)
+
+
+async def _shared_folder_trash(name: str, user: str | None = None):
+    if not _shared_is_local():
+        return await _shared_forward("DELETE", "/shared/folders", params={"name": name, "user": user or ""})
+    name = str(name or "").strip().strip("/")
+    acct = _shared_account(user)
+    data = _shared_manifest()
+    f = next((x for x in data["folders"] if x.get("name") == name), None)
+    if f is None:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    if acct != (f.get("created_by") or "") and not _shared_is_admin(acct):
+        raise HTTPException(status_code=403, detail="只有创建者可以删除")
+    docs = await _shared_local_docs()
+    now = datetime.now(timezone.utc).isoformat()
+    trash = data.setdefault("trash", [])
+    # 本文件夹 + 全部子孙条目一起入回收箱（文档保留，仅清单摘除）
+    doomed = [x for x in data["folders"] if x.get("name") == name or str(x.get("name") or "").startswith(name + "/")]
+    for x in doomed:
+        xname = str(x.get("name") or "")
+        xprefix = f"{SHARED_NS}/{xname}/"
+        doc_ids = [str(d["doc_id"]) for d in docs
+                   if str(d["title"]).startswith(xprefix) and not str(d["doc_id"]).startswith("task-")]
+        trash.append({
+            "id": uuid.uuid4().hex[:12],
+            "kind": "folder",
+            "name": xname,
+            "doc_ids": doc_ids,
+            "members": x.get("members") or [],
+            "created_by": x.get("created_by") or "",
+            "alias": x.get("alias") or "",
+            "renames": x.get("renames") or {},
+            "deleted_by": acct,
+            "deleted_at": now,
+        })
+    doomed_names = {str(x.get("name") or "") for x in doomed}
+    data["folders"] = [x for x in data["folders"] if str(x.get("name") or "") not in doomed_names]
+    _shared_manifest_save(data)
+    return {"ok": True, "trashed": len(doomed), "trashed_docs": sum(len(t["doc_ids"]) for t in trash[-len(doomed):])}
+
+
+@app.post("/shared/publish")
+async def shared_publish(
+    file: UploadFile = File(...),
+    folder: str = Form(...),
+    user: str | None = Form(None),
+):
+    if not _shared_is_local():
+        content = await file.read()
+        files = {"file": (file.filename or "upload.bin", content, file.content_type or "application/octet-stream")}
+        return await _shared_forward("POST", "/shared/publish", files=files,
+                                     data={"folder": folder, "user": user or ""})
+    name = Path(file.filename or "upload.bin").name or "upload.bin"
+    if name in (".", "..") or "\x00" in name:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    folder = folder.strip().strip("/")
+    acct = _shared_account(user)
+    data = _shared_manifest()
+    segs = [p for p in folder.split("/") if p]
+    if not segs or any(p in (".", "..") for p in segs):
+        raise HTTPException(status_code=400, detail="invalid folder path")
+    # 权限按"最长已存在的祖先条目"判定
+    anc = None
+    for i in range(len(segs), 0, -1):
+        cand = "/".join(segs[:i])
+        m = next((x for x in data["folders"] if x.get("name") == cand), None)
+        if m is not None:
+            anc = m
+            break
+    if anc is None:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    if not _shared_folder_visible(anc, acct) and not _shared_is_admin(acct):
+        raise HTTPException(status_code=403, detail="没有该共享文件夹的权限")
+    # 沿途缺失的子文件夹条目自动补齐（继承祖先成员）
+    now = datetime.now(timezone.utc).isoformat()
+    f = None
+    for i in range(1, len(segs) + 1):
+        cand = "/".join(segs[:i])
+        f = next((x for x in data["folders"] if x.get("name") == cand), None)
+        if f is None:
+            f = {"name": cand, "members": list(anc.get("members") or []),
+                 "created_by": anc.get("created_by") or acct, "created_at": now}
+            data["folders"].append(f)
+    upload_dir = Path(UPLOAD_DIR)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    dest = upload_dir / f"{uuid.uuid4().hex[:8]}-{name}"
+    try:
+        with dest.open("wb") as out:
+            shutil.copyfileobj(file.file, out)
+    except Exception as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"failed to save upload: {exc}")
+    if dest.stat().st_size == 0:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="uploaded file is empty")
+    display_path = f"{SHARED_NS}/{folder}/{name}"
+    params: dict[str, Any] = {"path": str(dest), "display_path": display_path}
+    error = _validate("ingest", params)
+    if error:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=error)
+    task_id = _submit("ingest", params)
+    _manifest_add(dest.name, display_path)
+    _register_processing(task_id, display_path)
+    return {"ok": True, "task_id": task_id, "display_path": display_path}
+
+
+@app.get("/shared/file")
+async def shared_file(doc_id: str, download: int = 0):
+    if not _shared_is_local():
+        return await _shared_forward("GET", "/shared/file", params={"doc_id": doc_id, "download": download}, raw=True)
+    return await document_file(doc_id, download=download)
+
+
+@app.get("/shared/content")
+async def shared_content(doc_id: str):
+    if not _shared_is_local():
+        return await _shared_forward("GET", "/shared/content", params={"doc_id": doc_id})
+    return await document_content(doc_id)
+
+
+@app.put("/shared/files")
+async def shared_file_rename(request: Request):
+    """共享文件改名（清单级 display 改名，不动底层文档）。"""
+    body = await request.json()
+    if not _shared_is_local():
+        return await _shared_forward("PUT", "/shared/files", json_body=body)
+    folder = str(body.get("folder") or "").strip().strip("/")
+    doc_id = str(body.get("doc_id") or "").strip()
+    name = str(body.get("name") or "").strip()
+    user = _shared_account(body.get("user"))
+    if not folder or not doc_id or not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid rename payload")
+    data = _shared_manifest()
+    f = next((x for x in data["folders"] if x.get("name") == folder), None)
+    if f is None:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    if user != (f.get("created_by") or "") and not _shared_is_admin(user) and user not in (f.get("members") or []):
+        raise HTTPException(status_code=403, detail="没有权限")
+    docs = await _shared_local_docs()
+    prefix = f"{SHARED_NS}/{folder}/"
+    hit = next((d for d in docs if str(d["doc_id"]) == doc_id and str(d["title"]).startswith(prefix)), None)
+    if hit is None:
+        raise HTTPException(status_code=404, detail="共享文件不存在")
+    f.setdefault("renames", {})[doc_id] = name
+    _shared_manifest_save(data)
+    return {"ok": True, "name": name}
+
+
+@app.delete("/shared/files")
+async def shared_file_trash(folder: str, doc_id: str, user: str | None = None):
+    """删除共享文件 → 入回收箱（文档保留）。"""
+    if not _shared_is_local():
+        return await _shared_forward("DELETE", "/shared/files",
+                                     params={"folder": folder, "doc_id": doc_id, "user": user or ""})
+    folder = folder.strip().strip("/")
+    acct = _shared_account(user)
+    data = _shared_manifest()
+    f = next((x for x in data["folders"] if x.get("name") == folder), None)
+    if f is None:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    if acct != (f.get("created_by") or "") and not _shared_is_admin(acct):
+        raise HTTPException(status_code=403, detail="只有创建者或管理员可以删除")
+    docs = await _shared_local_docs()
+    prefix = f"{SHARED_NS}/{folder}/"
+    hit = next((d for d in docs if str(d["doc_id"]) == doc_id and str(d["title"]).startswith(prefix)), None)
+    if hit is None:
+        raise HTTPException(status_code=404, detail="共享文件不存在")
+    title = str(hit["title"]).replace("\\", "/")
+    data.setdefault("trash", []).append({
+        "id": uuid.uuid4().hex[:12],
+        "kind": "file",
+        "folder": folder,
+        "name": title.split("/")[-1],
+        "doc_ids": [str(hit["doc_id"])],
+        "deleted_by": acct,
+        "deleted_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _shared_manifest_save(data)
+    return {"ok": True}
+
+
+@app.get("/shared/trash")
+async def shared_trash(user: str | None = None):
+    """回收箱清单（仅管理员）。"""
+    if not _shared_is_local():
+        return await _shared_forward("GET", "/shared/trash", params={"user": user or ""})
+    acct = _shared_account(user)
+    if not _shared_is_admin(acct):
+        raise HTTPException(status_code=403, detail="仅管理员可以查看回收箱")
+    data = _shared_manifest()
+    entries = sorted(data.get("trash") or [], key=lambda x: str(x.get("deleted_at") or ""), reverse=True)
+    return {"trash": entries, "account": acct}
+
+
+@app.post("/shared/trash/restore")
+async def shared_trash_restore(request: Request):
+    """从回收箱还原（仅管理员）。"""
+    body = await request.json()
+    if not _shared_is_local():
+        return await _shared_forward("POST", "/shared/trash/restore", json_body=body)
+    acct = _shared_account(body.get("user"))
+    if not _shared_is_admin(acct):
+        raise HTTPException(status_code=403, detail="仅管理员可以还原")
+    tid = str(body.get("id") or "").strip()
+    data = _shared_manifest()
+    trash = data.get("trash") or []
+    entry = next((x for x in trash if str(x.get("id")) == tid), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="回收箱记录不存在")
+    if entry.get("kind") == "folder":
+        name = str(entry.get("name") or "")
+        if any(str(x.get("name") or "") == name for x in data["folders"]):
+            raise HTTPException(status_code=409, detail="同名文件夹已存在，无法还原")
+        data["folders"].append({
+            "name": name,
+            "members": entry.get("members") or [],
+            "created_by": entry.get("created_by") or acct,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            **({"alias": entry["alias"]} if entry.get("alias") else {}),
+            **({"renames": entry["renames"]} if entry.get("renames") else {}),
+        })
+    data["trash"] = [x for x in trash if str(x.get("id")) != tid]
+    _shared_manifest_save(data)
+    return {"ok": True}
+
+
+@app.delete("/shared/trash/{tid}")
+async def shared_trash_purge(tid: str, user: str | None = None):
+    """彻底删除回收箱记录（仅管理员）：真实删除底层文档。"""
+    if not _shared_is_local():
+        return await _shared_forward("DELETE", f"/shared/trash/{quote(tid, safe='')}", params={"user": user or ""})
+    acct = _shared_account(user)
+    if not _shared_is_admin(acct):
+        raise HTTPException(status_code=403, detail="仅管理员可以彻底删除")
+    data = _shared_manifest()
+    trash = data.get("trash") or []
+    entry = next((x for x in trash if str(x.get("id")) == tid), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="回收箱记录不存在")
+    removed = 0
+    for did in entry.get("doc_ids") or []:
+        if str(did).startswith("task-"):
+            continue
+        _submit("delete_document", {"doc_id": str(did)})
+        removed += 1
+    data["trash"] = [x for x in trash if str(x.get("id")) != tid]
+    _shared_manifest_save(data)
+    return {"ok": True, "removed_docs": removed}
+
+
+@app.get("/shared/download")
+async def shared_download(folder: str, user: str | None = None):
+    """共享文件夹打包下载（zip，含子文件夹）。"""
+    if not _shared_is_local():
+        return await _shared_forward("GET", "/shared/download",
+                                     params={"folder": folder, "user": user or ""}, raw=True)
+    folder = folder.strip().strip("/")
+    acct = _shared_account(user)
+    data = _shared_manifest()
+    f = next((x for x in data["folders"] if x.get("name") == folder), None)
+    if f is None:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    if not _shared_folder_visible(f, acct) and not _shared_is_admin(acct):
+        raise HTTPException(status_code=403, detail="没有该共享文件夹的权限")
+    prefix = f"{SHARED_NS}/{folder}/"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for d in await _shared_local_docs():
+            title = str(d["title"]).replace("\\", "/")
+            if not title.startswith(prefix) or str(d["doc_id"]).startswith("task-"):
+                continue
+            src = _original_file_of(title)
+            if src and Path(src).is_file():
+                zf.write(src, title[len(SHARED_NS) + 1:])
+    buf.seek(0)
+    zname = (folder.replace("/", "_") or "shared") + ".zip"
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(zname)}"})
+
+
 @app.get("/index/stats")
 async def index_stats():
     """Aggregate statistics for the KB panel's 索引 modal."""
