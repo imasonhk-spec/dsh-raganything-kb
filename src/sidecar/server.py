@@ -1110,6 +1110,10 @@ def _build_rag():
 
     llm_cfg = CONFIG["llm"]
     api_key = os.environ.get("RAG_LLM_API_KEY") or llm_cfg.get("api_key") or ""
+    if not api_key and _is_local_base_url(llm_cfg.get("base_url")):
+        # 本机 Ollama 的 OpenAI 兼容端点不校验 Authorization，给占位值即可；
+        # 否则「选了本地模型但没配 key」会让整个 RAG 实例构建失败。
+        api_key = _LOCAL_LLM_PLACEHOLDER_KEY
     if not api_key:
         raise RuntimeError(
             "no LLM API key: set the RAG_LLM_API_KEY environment variable "
@@ -1149,6 +1153,11 @@ def _build_rag():
                 routed_index = True
         if routed_index and index_reasoning_effort:
             kwargs.setdefault("reasoning_effort", index_reasoning_effort)
+        # 索引模型若在本机 Ollama 上存在就走本机端点，否则「llm 用本地、
+        # index_llm 用云端」这种半套配置会静默把入库打挂。
+        call_base_url = llm_cfg["base_url"]
+        if routed_index:
+            call_base_url = _resolve_base_url("llm", model, None) or call_base_url
         try:
             return await openai_complete_if_cache(
                 model,
@@ -1156,7 +1165,7 @@ def _build_rag():
                 system_prompt=system_prompt,
                 history_messages=history_messages or [],
                 api_key=api_key,
-                base_url=llm_cfg["base_url"],
+                base_url=call_base_url,
                 **kwargs,
             )
         except Exception as exc:
@@ -1170,7 +1179,7 @@ def _build_rag():
                         system_prompt=system_prompt,
                         history_messages=history_messages or [],
                         api_key=api_key,
-                        base_url=llm_cfg["base_url"],
+                        base_url=call_base_url,
                         **kwargs,
                     )
                 except Exception as exc2:
@@ -2459,10 +2468,11 @@ async def _chat_stream(prompt: str, system_prompt: str, timeout_s: float = 900.0
         ],
         "stream": True,
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    # 空 api_key 必须**不发** Authorization 头：f"Bearer {api_key}" 在 key 为空时
+    # 得到 b"Bearer "（尾部空格），httpx 直接抛 LocalProtocolError，比 401 更难排查。
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=30.0)) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as resp:
             resp.raise_for_status()
@@ -2485,6 +2495,39 @@ async def _chat_stream(prompt: str, system_prompt: str, timeout_s: float = 900.0
                     yield "thinking", delta["reasoning_content"]
                 if delta.get("content"):
                     yield "answer", delta["content"]
+
+
+_EXTRACTION_MARKERS = ("entity<|#|>", "relation<|#|>", "<|COMPLETE|>")
+
+
+def _looks_like_extraction(text: str) -> bool:
+    """判断一段回答是不是被模型写成了 LightRAG 的实体/关系抽取原文。
+
+    背景（2026-09-13）：Ollama 里没有 chat template 的模型（`/api/show` 的 template
+    为 `{{ .Prompt }}`）在长文档上下文下会间歇性滑向「文档处理模式」，把实体抽取结果
+    当回答吐出来。`<|#|>` / `<|COMPLETE|>` 是 LightRAG 抽取链路的分隔符
+    （tuple_delimiter / completion_delimiter），正常中文问答里不会出现，因此命中即可
+    判定退化。判定刻意保守：短文本不判，避免用户真的在问这两个分隔符本身时被误伤。
+    """
+    body = (text or "").strip()
+    if len(body) < 40:
+        return False
+    if "<|COMPLETE|>" in body:
+        return True
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    tagged = sum(1 for ln in lines
+                 if ln.startswith(("entity<|#|>", "relation<|#|>",
+                                   "entity<|##|>", "relation<|##|>")))
+    return tagged >= 2 and tagged * 2 >= len(lines)
+
+
+_ANTI_EXTRACTION_NUDGE = (
+    "\n\n【重要】你上一次的回答误用了实体抽取格式（出现了 <|#|> 或 <|COMPLETE|>）。"
+    "请重新回答：用自然流畅的中文、以普通段落或条目直接作答，"
+    "绝对不要输出 entity/relation 行，也不要输出 <|#|>、<|COMPLETE|> 这类分隔符。"
+)
 
 
 SCOPED_SYSTEM_PROMPT = (
@@ -2551,27 +2594,48 @@ async def _run_scoped_query_op(rag, query_text: str, files: list[str],
         f"请只依据上述参考资料作答。"
     )
 
-    thinking = ""
-    answer = ""
-    last_tick = 0.0
-    async for kind, delta in _chat_stream(prompt, SCOPED_SYSTEM_PROMPT):
-        if kind == "thinking":
-            thinking += delta
-        else:
-            answer += delta
-        now = time.time()
-        if now - last_tick >= 0.8:
-            last_tick = now
-            set_progress("generating", "正在生成回答…", thinking=thinking, answer=answer)
+    async def _answer_once(sys_prompt: str) -> tuple[str, str]:
+        """跑一轮流式生成，返回 (thinking, answer)。
 
-    # 兜底：部分模型不吐 reasoning_content，而是把思考包在 <think> 里。
-    if "<think>" in answer:
-        head, sep, tail = answer.partition("</think>")
-        if sep:
-            thinking = (thinking + head.split("<think>", 1)[-1]).strip()
-            answer = tail
-        else:
-            answer = answer.replace("<think>", "").strip()
+        兜底：部分模型不吐 reasoning_content，而是把思考包在 <think> 里。
+        """
+        th = ""
+        an = ""
+        tick = 0.0
+        async for kind, delta in _chat_stream(prompt, sys_prompt):
+            if kind == "thinking":
+                th += delta
+            else:
+                an += delta
+            now = time.time()
+            if now - tick >= 0.8:
+                tick = now
+                set_progress("generating", "正在生成回答…", thinking=th, answer=an)
+        if "<think>" in an:
+            head, sep, tail = an.partition("</think>")
+            if sep:
+                th = (th + head.split("<think>", 1)[-1]).strip()
+                an = tail
+            else:
+                an = an.replace("<think>", "").strip()
+        return th, an
+
+    thinking, answer = await _answer_once(SCOPED_SYSTEM_PROMPT)
+
+    # 退化防护（2026-09-13）：本机模型可能在长文档上下文下把回答写成 LightRAG 实体
+    # 抽取原文。检测到就用显式纠正指令重跑一次；仍退化则打 degraded 标记，前端据此
+    # 不再把这段文本写进「知识库产物」（否则抽取原文会被再次入库、自我强化）。
+    degraded = _looks_like_extraction(answer)
+    if degraded:
+        print(f"[sidecar] answer looks like LightRAG extraction (len={len(answer)}), retry once")
+        _auto_log("问答格式退化", f"命中抽取格式，已用纠正指令重试 · {query_text[:80]}")
+        set_progress("generating", "回答格式异常，正在重新生成…", thinking=thinking, answer=answer)
+        retry_thinking, retry_answer = await _answer_once(SCOPED_SYSTEM_PROMPT + _ANTI_EXTRACTION_NUDGE)
+        if retry_answer.strip():
+            thinking, answer = retry_thinking, retry_answer
+            degraded = _looks_like_extraction(answer)
+        if degraded:
+            _auto_log("问答格式退化", "重试后仍为抽取格式，已标记 degraded=True")
 
     set_progress("done", "回答完成", thinking=thinking, answer=answer)
     task["result"] = {
@@ -2582,6 +2646,7 @@ async def _run_scoped_query_op(rag, query_text: str, files: list[str],
         "excluded": exclude_prefixes or [],
         "hits": len(hits),
         "sources": [str(h.get("file_path") or "") for h in hits[:10]],
+        "degraded": degraded,
         "elapsed": round(time.time() - q_started, 1),
     }
 
@@ -3215,11 +3280,16 @@ async def _run_query_op(params: dict[str, Any], task: dict[str, Any]) -> None:
                     set_progress("generating", "模型思考中…", thinking=thinking, answer=answer)
                 else:
                     set_progress("generating", "正在生成回答…", thinking=thinking, answer=answer)
+        _plain_degraded = _looks_like_extraction(answer)
+        if _plain_degraded:
+            _auto_log("问答格式退化",
+                      f"全库检索路径命中抽取格式（len={len(answer)}）· {query_text[:80]}")
         set_progress("done", "回答完成", thinking=thinking, answer=answer)
         task["result"] = {
             "answer": answer,
             "mode": mode,
             "thinking": thinking,
+            "degraded": _plain_degraded,
             "elapsed": round(time.time() - q_started, 1),
         }
     finally:
@@ -3525,6 +3595,105 @@ def _config_save() -> None:
         print(f"[sidecar] config save failed: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# 本机 Ollama 端点自适应（KB_LOCAL_OLLAMA_ENDPOINT_FIX_v1）
+#
+# 面板「AI 模型」下拉里的候选项来自 DSH 主机的模型目录，而目录只给 model id、
+# **不带 base_url**。用户改用本机 Ollama 模型（如 qwen3.6:35b）时，
+# /models/select 只改了模型名，llm.base_url 仍停留在云端
+# （https://tokens.store/v1）——出网一旦被中间人接管，问答就必然报
+# CERTIFICATE_VERIFY_FAILED。这里让 sidecar 自己认出「这是本机 Ollama 上
+# 存在的模型」，把端点落回本机，并在启动时自愈历史遗留的半套配置。
+# ---------------------------------------------------------------------------
+LOCAL_OLLAMA_BASE = (os.environ.get("RAG_LOCAL_OLLAMA_BASE_URL")
+                     or "http://127.0.0.1:11434/v1")
+_LOCAL_MODELS_CACHE: dict[str, Any] = {"at": 0.0, "names": set()}
+_LOCAL_HEAL_ENABLED = (os.environ.get("RAG_LOCAL_ENDPOINT_HEAL", "on")
+                       .strip().lower() not in {"0", "off", "no", "false"})
+
+_LOCAL_LLM_PLACEHOLDER_KEY = "ollama"
+
+
+def _is_local_base_url(base_url: Any) -> bool:
+    """端点是否指向本机（loopback）的 OpenAI 兼容服务。"""
+    b = str(base_url or "").strip().lower()
+    return b.startswith("http://127.0.0.1:") or b.startswith("http://localhost:")
+
+
+def _local_ollama_models(force: bool = False) -> set[str]:
+    """本机 Ollama 已安装模型名集合（30s 缓存；查询失败不写缓存）。"""
+    now = time.time()
+    names = _LOCAL_MODELS_CACHE["names"]
+    if not force and names and now - _LOCAL_MODELS_CACHE["at"] < 30.0:
+        return names
+    found: set[str] = set()
+    root = LOCAL_OLLAMA_BASE.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    try:
+        import httpx as _httpx
+        with _httpx.Client(timeout=_httpx.Timeout(3.0, connect=2.0)) as client:
+            resp = client.get(root.rstrip("/") + "/api/tags")
+            resp.raise_for_status()
+            for item in (resp.json().get("models") or []):
+                name = item.get("name") or item.get("model")
+                if name:
+                    found.add(str(name))
+                    found.add(str(name).split(":")[0])
+    except Exception:  # noqa: BLE001 - 本机没起 Ollama 时静默降级
+        return names
+    if found:
+        _LOCAL_MODELS_CACHE["at"] = now
+        _LOCAL_MODELS_CACHE["names"] = found
+    return found
+
+
+def _is_local_ollama_model(model: Any) -> bool:
+    m = str(model or "").strip()
+    return bool(m) and m in _local_ollama_models()
+
+
+def _resolve_base_url(category: str, model: Any, base_url: Any) -> str | None:
+    """把「只给了模型名」的选择补全成可用端点。
+
+    优先级：显式 base_url > custom_models 里同名条目 > 本机 Ollama
+    （模型在本机存在时）。都不匹配返回 None，调用方保持原端点不动。
+    """
+    if base_url:
+        return str(base_url)
+    for entry in (CONFIG.get("custom_models", {}).get(category) or []):
+        if str(entry.get("model") or "") == str(model or "") and entry.get("base_url"):
+            return str(entry["base_url"])
+    if _is_local_ollama_model(model):
+        return LOCAL_OLLAMA_BASE
+    return None
+
+
+def _heal_local_model_endpoint() -> list[str]:
+    """启动自愈：模型在本机 Ollama 上、端点却不是本机的配置，改回本机。
+
+    修的正是「历史配置里模型名已经是本地的、base_url 还留在云端」这一形态。
+    设 RAG_LOCAL_ENDPOINT_HEAL=off 可关闭。
+    """
+    changed: list[str] = []
+    if not _LOCAL_HEAL_ENABLED:
+        return changed
+    local = _local_ollama_models(force=True)
+    if not local:
+        return changed
+    for category in ("llm", "vision"):
+        cfg = CONFIG.get(category) or {}
+        model = str(cfg.get("model") or "")
+        base = str(cfg.get("base_url") or "")
+        if model and model in local and not _is_local_base_url(base):
+            cfg["base_url"] = LOCAL_OLLAMA_BASE
+            CONFIG[category] = cfg
+            changed.append(f"{category}:{model} -> {LOCAL_OLLAMA_BASE}")
+    if changed:
+        _config_save()
+    return changed
+
+
 def _public_selections() -> dict[str, Any]:
     """Current default-model selections, read live from the in-memory CONFIG."""
     llm = CONFIG.get("llm") or {}
@@ -3652,16 +3821,22 @@ async def models_select(body: dict[str, Any]):
         if not model:
             raise HTTPException(status_code=400, detail="model is required")
         CONFIG.setdefault("llm", {})["model"] = model
-        if base_url:
-            CONFIG["llm"]["base_url"] = base_url
+        # 面板只给模型名时（DSH 模型目录不带 base_url）自动补全端点：
+        # 本机 Ollama 上存在的模型一律落到本机端点，避免「选了本地模型、
+        # 请求仍发往云端」→ CERTIFICATE_VERIFY_FAILED。
+        _resolved_base = _resolve_base_url("llm", model, base_url)
+        if _resolved_base:
+            CONFIG["llm"]["base_url"] = _resolved_base
         if api_key:
             CONFIG["llm"]["api_key"] = api_key
     elif category == "vision":
         if not model:
             raise HTTPException(status_code=400, detail="model is required")
         CONFIG.setdefault("vision", {})["model"] = model
-        if base_url:
-            CONFIG["vision"]["base_url"] = base_url
+        # 同 llm：模型名在本机 Ollama 上时自动落到本机端点。
+        _resolved_base = _resolve_base_url("vision", model, base_url)
+        if _resolved_base:
+            CONFIG["vision"]["base_url"] = _resolved_base
         if api_key:
             CONFIG["vision"]["api_key"] = api_key
     elif category == "index_llm":
@@ -3782,6 +3957,10 @@ async def models_restart():
     新进程继承当前环境（RAG_SIDECAR_* / RAG_LLM_API_KEY 等），DSH 插件会在下次
     health 检查时收养它。"""
     env = os.environ.copy()
+    # 旧进程要等 ~1s 才释放监听端口；新进程若在同一秒内 bind，会拿到
+    # EADDRINUSE 后自杀，结果是「旧的新的一起没了、端口没人听」。
+    # 这里让新进程先等端口空出来（幂等：每次自重启都会重新注入）。
+    env["RAG_RESTART_DELAY_S"] = "4"
     log_path = Path(CONFIG_PATH).parent / "logs" / "sidecar.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     logf = open(log_path, "a")
@@ -3940,6 +4119,13 @@ async def _start_background_loops():
     else:
         print("[sidecar] workspace sync disabled by config")
     asyncio.get_running_loop().create_task(_retry_reaper_loop())
+    # 启动自愈：模型在本机 Ollama 上、端点却仍指向云端的配置，自动改回本机。
+    try:
+        _healed = _heal_local_model_endpoint()
+        if _healed:
+            print(f"[sidecar] local model endpoint healed: {', '.join(_healed)}")
+    except Exception as exc:  # noqa: BLE001 - 自愈失败不得影响启动
+        print(f"[sidecar] local endpoint heal skipped: {type(exc).__name__}: {exc}")
     # 首次启动自动就绪：本地 GGUF embedding 缺运行时/模型时自动补齐。
     asyncio.get_running_loop().create_task(_bootstrap_default_embedding())
 
@@ -5384,5 +5570,11 @@ async def unhandled(_request, exc):
 
 if __name__ == "__main__":
     import uvicorn
+
+    # 自重启（POST /models/restart）注入的等待：等旧进程释放监听端口。
+    _restart_delay = float(os.environ.get("RAG_RESTART_DELAY_S") or 0.0)
+    if _restart_delay > 0:
+        print(f"[sidecar] self-restart: waiting {_restart_delay}s for port {PORT} to be released")
+        time.sleep(_restart_delay)
 
     uvicorn.run(app, host=HOST, port=PORT, log_level="info", access_log=False)

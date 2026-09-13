@@ -140,7 +140,10 @@ window.__ModuleLoader__.load({
 			return {
 				answer: task.result.answer,
 				thinking: task.result.thinking ?? "",
-				mode: task.result.mode ?? mode
+				mode: task.result.mode ?? mode,
+				// 回答被判定退化成 LightRAG 抽取原文（sidecar 侧会先重试一次），
+				// 前端据此不再把它写进「知识库产物」。
+				degraded: task.result.degraded === true
 			};
 		}
 		/** Ingest raw text under a title; resolves the resulting doc id, or null on failure. */
@@ -165,6 +168,22 @@ window.__ModuleLoader__.load({
 			if (/\bexcel\b|\.xls\b|xlsx|excel格式|excel表格|excel 表格|以excel|做成表格|输出表格|生成表格/.test(q)) return "xlsx";
 			if (/\bppt\b|pptx|ppt格式|ppt演示|ppt 演示|演示文稿|幻灯片|以ppt|做成ppt|生成ppt/.test(q)) return "pptx";
 			return null;
+		}
+		/**
+		* Detect a degenerate KB answer that came back as LightRAG's raw entity /
+		* relation extraction text. `<|#|>` / `<|COMPLETE|>` are LightRAG-only
+		* delimiters, so a normal Chinese answer never contains them. Such an answer
+		* must never be re-ingested as a 「知识库产物」 artifact — that would feed the
+		* extraction text back into the KB and make the failure self-reinforcing.
+		*/
+		function isDegenerateAnswer(text) {
+			const s = String(text || "").trim();
+			if (s.length < 40) return false;
+			if (s.includes("<|COMPLETE|>")) return true;
+			const lines = s.split("\n").map((l) => l.trim()).filter(Boolean);
+			if (lines.length === 0) return false;
+			const tagged = lines.filter((l) => l.startsWith("entity<|#|>") || l.startsWith("relation<|#|>")).length;
+			return tagged >= 2 && tagged * 2 >= lines.length;
 		}
 		/**
 		* Ask the sidecar to generate an Office file (.docx/.xlsx/.pptx) from
@@ -2811,7 +2830,11 @@ window.__ModuleLoader__.load({
 						const officeFmt = detectOfficeFormat(text);
 						const qaText = `# 问题\n\n${text}\n\n# 回答\n\n${res.answer}\n`;
 						const baseTitle = `${PIN_KB}/${sessSegs}/${qName}-${hhmmss}`;
-						if (officeFmt) {
+						// 退化回答不写产物：否则抽取原文会被再次入库，形成自我强化。
+						const degenerate = res.degraded === true || isDegenerateAnswer(res.answer);
+						if (degenerate) {
+							console.warn("[kb] answer looks like LightRAG extraction; artifact skipped:", String(res.answer || "").slice(0, 120));
+						} else if (officeFmt) {
 							ragIngestOffice(qaText, `${baseTitle}.${officeFmt}`, officeFmt).then((r) => {
 								if (r !== null) refresh();
 							});
