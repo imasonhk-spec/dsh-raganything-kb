@@ -33,6 +33,53 @@ python build/build_rel0312.py \
 
 这样打出来的包与线上**热修后的活副本**字节一致，避免"热修在跑、重装回退"的两套状态。
 
+## 从发行 tgz 组装可移植包（`.tgz` → `-portable.tar.gz`）
+
+共享知识库线（`0.3.x-sharedkb`）原先只发 `.tgz`（给 pnpm profile 依赖用），
+没有对应的整机可移植包。本组装器把两者打通：以发行 tgz 为载荷来源，
+配上 `packaging/` 骨架与供体 manifest，产出 `-portable.tar.gz`。
+
+| 脚本 | 作用 |
+| --- | --- |
+| `build_portable_0312.py` | 由 `dist/dsh-raganything-kb-0.3.12-sharedkb.tgz` + `packaging/` 骨架 + 供体 manifest 组装可移植包：抬 `PKG_VERSION`、断言 `payload/sidecar/viewer` 在包内、对 `install.sh`/`uninstall.sh`/`verify.sh` 按**退出码**做 `bash -n` 自检、最后自查 `manifest.json` 文件清单 == 归档实际条目 |
+
+```bash
+python build/build_portable_0312.py \
+    --tgz       dist/dsh-raganything-kb-0.3.12-sharedkb.tgz \
+    --skeleton  packaging \
+    --donor     /path/to/older-portable-dir/manifest.json \
+    --out       dist/dsh-raganything-kb-0.3.12-sharedkb-portable.tar.gz
+```
+
+确定性打包（同 `build_rel0312.py`），同输入同 md5；产物 216 条目 / 10 794 665 B。
+
+> **两个易踩的点**（构建器已内置断言）：
+> ① `bash -n` 必须按**退出码**判，早期构建器按 stdout 判，漏掉了 `uninstall.sh` 的 CRLF 缺陷；
+> ② `manifest.json` 不会把自己列进文件清单，自查时要 `arc_files - {"manifest.json"}`。
+
+## 把新包切到多用户宿主的所有 profile
+
+| 脚本 | 作用 |
+| --- | --- |
+| `inventory_profiles_0312.py` | **只读**盘点宿主 + 11 个用户 profile 的插件安装：依赖指向哪个 tgz、`node_modules/dsh-raganything-kb` 是真目录还是软链、已装副本与新载荷的逐文件差异。顺带把新包解到 `/tmp/rel0312` 供比对。先跑它再决定要不要动 |
+| `deploy_profiles_0312.py` | 把 12 份依赖从旧 tgz 切到新 tgz。**逐份改三处**：profile `package.json` 的依赖、已安装包的 `package.json`、补 `RELEASE-NOTES.md`；每份先留 `.bak-*`。默认 dry-run，`--apply` 才落盘，可重复执行（二次运行报 12/12 already） |
+| `drill_0312_no_collateral_kill.sh` | 在**跑着生产 sidecar 的宿主**上做沙盒安装演练，并对比演练前后 `pgrep -af server.py` 的列表：必须零差异。退出码 0 = 无连带误杀。0.3.12 之前安装器的无锚点 `pkill` 在这里会现形 |
+| `respawn_user_sidecar.sh` | 某个**用户实例** sidecar 被杀且没自愈时，按插件 `spawnSidecar()` 同款环境把它拉回来。宿主 sidecar 有 `Restart=always` 自愈，**用户实例是懒加载的、插件只"接管"已在跑的进程，杀了没人管** → 网关 502 `rag sidecar on port <p> unreachable`。用法 `USER=admin PORT=32001 bash respawn_user_sidecar.sh`（slot → 端口 = 32000+slot） |
+
+三个脚本都在**目标宿主**上跑（8.6 上以 `lgsj` 身份，无需 sudo）：
+
+```bash
+python3 inventory_profiles_0312.py > /tmp/inv.json
+python3 deploy_profiles_0312.py            # dry-run，看输出
+python3 deploy_profiles_0312.py --apply    # 落盘
+PKG=/tmp/dsh-raganything-kb-0.3.12-sharedkb-portable.tar.gz \
+    bash drill_0312_no_collateral_kill.sh
+```
+
+**刻意不跑 `pnpm install`**：8.6 无公网出口，且 `pnpm install` 会清掉现场的 `.bak-*` 备份。
+`pnpm-lock.yaml` 本来就早已失配（还指 0.3.8），而 unit 是 `ExecStart=pnpm dsh web`、
+不触发安装，所以直接改依赖不引入新的启动风险。
+
 ## 把补丁送到已分叉的部署
 
 | 脚本 | 作用 |

@@ -63,17 +63,24 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 
 ## 安装（可移植包）
 
-可移植包由 `packaging/`（安装器 + 载荷 + 校验清单）与 `src/`（插件源码）组装，`plugin/` 内为 `dsh plugin add` 用的插件包（由 `tools/_pack_kb.py` 确定性打包）：
+可移植包由 `packaging/`（安装器 + 载荷 + 校验清单）与 `src/`（插件源码）组装，`plugin/` 内为 `dsh plugin add` 用的插件包（由 [`build/pack_kb.py`](build/pack_kb.py) 确定性打包）：
 
 ```bash
-tar xzf dsh-raganything-kb-0.3.10-portable.tar.gz
-cd dsh-raganything-kb-0.3.10-portable
+tar xzf dsh-raganything-kb-0.3.12-sharedkb-portable.tar.gz
+cd dsh-raganything-kb-0.3.12-sharedkb-portable
 SUDO_PW='<sudo 密码>' ./install.sh --profile web   # 以 DSH 属主用户运行，不要用 root
 ./verify.sh --profile web --deep                   # --deep 会真的提交一次查询验证整条链路
 ```
 
 安装器是**幂等**的：**升级直接重跑 `install.sh`，不要先卸载**（卸载会删插件目录）。
 每一步都会留 `.bak-*` 备份，旧版本也会存一份到 `~/.dsh/raganything/backup-portable-<时间戳>/`。
+
+> **多用户宿主注意**：`install.sh --no-systemd` 停旧 sidecar 时只会停**本实例自己**的进程
+> （pkill 锚定本实例 venv 路径 + 本实例 `$RAG_HOME/sidecar.pid`）。0.3.12 之前是无锚点的
+> `pkill -f "python.*server.py"`，在 8.6 这类多用户宿主上会连带杀掉宿主 sidecar 和其他用户的
+> 懒加载实例 —— 详见 [发布说明](docs/RELEASE-0.3.12-sharedkb.md)。
+
+发布件同时归档在 `releases/0.3.12-sharedkb/`（`.tgz` + `-portable.tar.gz` + `CHECKSUMS.md`）。
 
 ---
 

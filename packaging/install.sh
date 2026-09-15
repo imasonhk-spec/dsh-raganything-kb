@@ -213,6 +213,14 @@ materialize_payload() {
   cp -a "$HERE/payload/kb/config.json.template" "$TARGET/kb/config.json.template"
   cp -a "$HERE/payload/lib/."                   "$TARGET/lib/"
   cp -a "$HERE/payload/sidecar/server.py"       "$TARGET/sidecar/server.py"
+  # OFV viewer assets (pdf.js cmaps / standard fonts / ofv bundle). The sidecar
+  # mounts them statically at /viewer/*; without them 「打开原始文件」on Office /
+  # PDF artifacts has nothing to render. Older payloads did not ship this dir,
+  # so it is copied only when present (keeps this installer backwards-compatible).
+  if [ -d "$HERE/payload/sidecar/viewer" ]; then
+    mkdir -p "$TARGET/sidecar/viewer"
+    cp -a "$HERE/payload/sidecar/viewer/." "$TARGET/sidecar/viewer/"
+  fi
   # prune stale hand-made backups carried over from a previous install
   find "$TARGET" -name '*.bak-*' -type f -delete 2>/dev/null
 }
@@ -412,13 +420,25 @@ if [ "$USE_SYSTEMD" = "1" ] && command -v systemctl >/dev/null 2>&1 && have_sudo
   rm -f "$UNIT_TMP"
 else
   warn "systemd unavailable/disabled — supervising with nohup"
-  if [ -f "/tmp/raganything-sidecar.pid" ]; then kill "$(cat /tmp/raganything-sidecar.pid)" 2>/dev/null; fi
-  pkill -f "python.*server.py" 2>/dev/null
+  # PID_FILE lives under this install's own RAG_HOME, not in the shared /tmp
+  # namespace: on a multi-user host two installs would otherwise overwrite each
+  # other's pid and kill the wrong process.
+  PID_FILE="$RAG_HOME/sidecar.pid"
+  if [ -f "$PID_FILE" ]; then
+    kill "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+    rm -f "$PID_FILE"
+  fi
+  # Stop only THIS install's sidecar: anchor the pattern to our own venv path.
+  # A bare `pkill -f "python.*server.py"` also matches the systemd-managed host
+  # sidecar and every other user's lazily spawned instance on a multi-user host
+  # — observed 2026-09-15: a sandbox drill killed two unrelated production
+  # sidecars (Restart=always only rescued the systemd one).
+  pkill -f "$VENV_DIR.*server\.py" 2>/dev/null
   sleep 1
   ( cd "$TARGET/sidecar" && set -a && . "$ENV_FILE" && set +a && \
-    nohup "$VENV_DIR/bin/python" server.py >>"$RAG_HOME/logs/sidecar.log" 2>&1 & echo $! > /tmp/raganything-sidecar.pid )
+    nohup "$VENV_DIR/bin/python" server.py >>"$RAG_HOME/logs/sidecar.log" 2>&1 & echo $! > "$PID_FILE" )
   sleep 2
-  ok "sidecar started (nohup, pid $(cat /tmp/raganything-sidecar.pid 2>/dev/null))"
+  ok "sidecar started (nohup, pid $(cat "$PID_FILE" 2>/dev/null))"
 fi
 
 # ================================================= 9) HTTPS /rag/ proxy ====

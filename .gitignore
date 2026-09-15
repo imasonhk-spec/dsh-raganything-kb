@@ -9,4 +9,5 @@ dist/
 
 # local scratch
 tmp_*
+.tmp_*
 .repo_push/

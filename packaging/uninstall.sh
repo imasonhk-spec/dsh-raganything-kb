@@ -44,8 +44,11 @@ if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null
   run_root "systemctl stop raganything-sidecar; systemctl disable raganything-sidecar" >/dev/null 2>&1 && echo "  ✔ systemd service stopped"
   [ "$KEEP_SERVICE" = "0" ] && run_root "rm -f /etc/systemd/system/raganything-sidecar.service /etc/systemd/system/raganything-sidecar.service.d/hardening.conf; systemctl daemon-reload" >/dev/null 2>&1 && echo "  ✔ unit removed"
 else
-  [ -f /tmp/raganything-sidecar.pid ] && kill "$(cat /tmp/raganything-sidecar.pid)" 2>/dev/null
-  pkill -f "python.*server\.py" 2>/dev/null && echo "  ✔ nohup sidecar killed" || echo "  · no sidecar process found"
+  PID_FILE="$RAG_HOME/sidecar.pid"
+  [ -f "$PID_FILE" ] && { kill "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; rm -f "$PID_FILE"; }
+  # Anchored to this install's own venv — a bare `python.*server.py` pattern also
+  # matches the systemd-managed host sidecar and other users' instances.
+  pkill -f "$RAG_HOME/venv.*server\.py" 2>/dev/null && echo "  ✔ nohup sidecar killed" || echo "  · no sidecar process found"
 fi
 
 echo "[2/5] revert profile manifest"
