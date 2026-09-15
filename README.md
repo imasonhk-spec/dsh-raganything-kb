@@ -38,6 +38,8 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 | 基准 | 纯插件代码 |
 | 多用户网关分支 | 基准 + 多用户隔离（`MU_NS` 命名空间、网关 basePath） |
 | 单机分支 | 基准 + 面板崩溃防护（`normaliseModelsSnap`） |
+| 多用户网关线 `0.3.x-sharedkb`（8.6 线上） | 多用户网关分支 + 共享知识库（`/shared/*`、回收箱）+ **产物「只落盘不入库」**（doc_id 前缀 `art-`），因此 `/documents/{art-*}/content` 需要单独分支处理（0.3.12 修复） |
+| `src/`（`0.4.0-sharedkb.1`） | 产物走「真实入库」模型（`file_path` 带 `DSH产物/`、`知识库产物/` 前缀），与上面这条线**不可互相整文件覆盖** |
 
 **给已分叉的部署打补丁，不要整文件覆盖** —— 用函数级锚点替换，并且每处都断言命中次数
 （见 `build/kb_artifact_rail_patch.py`、`build/apply_norm_fix.py`）。整文件覆盖会把对方独有的
@@ -47,6 +49,7 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 
 | 版本 | 内容 |
 | --- | --- |
+| **0.3.12-sharedkb** | 多用户网关线（8.6）发布件。「对话产物 → 打开原始文件」修复：`/documents/{art-<id>}/content` 由恒 404 改为 200（office 型返回空正文 + `file_path`，交前端 OFV 渲染）；顺带清掉 0.3.11 包内误带的 `.bak`。见 [`docs/RELEASE-0.3.12-sharedkb.md`](docs/RELEASE-0.3.12-sharedkb.md) |
 | **0.3.10** | ABCD 加固 + 多用户本地模型 SSL 彻底修复：`server.py` 本地端点自适应（选本地模型不再报 `CERTIFICATE_VERIFY_FAILED`）、`/models/restart` 端口竞态修复；`client.js` 退化答案检测 + `degraded` 透传（不再把退化回答写成「知识库产物」）；10 份 `config.json` 归一化到 `127.0.0.1:11434/v1`；问答模型切 `qwen3.6:35b-chat` |
 | 0.3.9 | 「索引」弹窗计数口径修复：`extDist` 遍历 `kbDocs` 而非全部 `docs`，弹窗数字与侧栏状态栏、目录树三者一致（此前状态栏 9、弹窗 455） |
 | 0.3.8 | 状态栏计数对齐目录树（`kbDocs.length`）；「对话产物」栏只列生成文件（跳过对话 `.md`）；`server.py` 增加 OFV `/viewer/*` 静态挂载 |
@@ -54,7 +57,9 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 | 0.3.6 | 多用户数据隔离；「删除后重传仍报重复」修复（A–G 七处）；`install.sh --no-pnpm` 解析器修复 |
 | 0.3.5 | 基线 |
 
-发布说明见 [`docs/RELEASE-0.3.10.md`](docs/RELEASE-0.3.10.md)（历史：[0.3.9](docs/RELEASE-0.3.9.md) · [0.3.8](docs/RELEASE-0.3.8.md) · [0.3.7](docs/RELEASE-0.3.7.md)）。
+发布说明见 [`docs/RELEASE-0.3.12-sharedkb.md`](docs/RELEASE-0.3.12-sharedkb.md)（sharedkb 线）、
+[`docs/RELEASE-0.3.10.md`](docs/RELEASE-0.3.10.md)（主 line；历史：[0.3.9](docs/RELEASE-0.3.9.md) · [0.3.8](docs/RELEASE-0.3.8.md) · [0.3.7](docs/RELEASE-0.3.7.md)）、
+[`docs/RELEASE-shared-kb.md`](docs/RELEASE-shared-kb.md)。
 
 ## 安装（可移植包）
 

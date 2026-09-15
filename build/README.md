@@ -18,6 +18,21 @@
 > 所以把 `HOME` 指向 `/tmp/...` 就能零风险跑完整安装 + `verify.sh`，完全不碰生产。
 > 演练里额外传 `--port 17999`，避免 verify 打到生产 sidecar。
 
+## 打一个发行 tgz（同线增量回灌）
+
+| 脚本 | 作用 |
+| --- | --- |
+| `build_rel0312.py` | 以**上一版发行 tgz** 为基线，把线上已验证的补丁回灌成新版本包（默认 0.3.11-sharedkb → 0.3.12-sharedkb）：替换 `server.py`、bump `package.json`、清掉包内误带的 `.bak`、补 `RELEASE-NOTES.md`，并**断言其余成员相对基线逐字节不变**。确定性打包（固定 mtime/uid/gid、条目排序、gzip `mtime=0`），同输入同 md5 |
+
+```bash
+python build/build_rel0312.py \
+    --base   dsh-raganything-kb-0.3.11-sharedkb.tgz \
+    --server-py /path/to/patched/sidecar/server.py \
+    --out    dist/dsh-raganything-kb-0.3.12-sharedkb.tgz
+```
+
+这样打出来的包与线上**热修后的活副本**字节一致，避免"热修在跑、重装回退"的两套状态。
+
 ## 把补丁送到已分叉的部署
 
 | 脚本 | 作用 |
