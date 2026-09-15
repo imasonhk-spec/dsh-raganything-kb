@@ -1109,7 +1109,11 @@ def _build_rag():
     from lightrag.utils import EmbeddingFunc
 
     llm_cfg = CONFIG["llm"]
-    api_key = os.environ.get("RAG_LLM_API_KEY") or llm_cfg.get("api_key") or ""
+    # 显式配置的 api_key 优先于全局 RAG_LLM_API_KEY：DSH 模型目录里的
+    # 「自定义端点」（如本机 llama.cpp 的 occamy-1.0，--api-key occamy）
+    # 自带密钥，而全局 key 往往是 tokens.store 的——若让全局 key 胜出，
+    # 请求会带着错误的 Bearer 打到自建端点，得到 401。
+    api_key = llm_cfg.get("api_key") or os.environ.get("RAG_LLM_API_KEY") or ""
     if not api_key and _is_local_base_url(llm_cfg.get("base_url")):
         # 本机 Ollama 的 OpenAI 兼容端点不校验 Authorization，给占位值即可；
         # 否则「选了本地模型但没配 key」会让整个 RAG 实例构建失败。
@@ -2455,10 +2459,50 @@ async def _scoped_hits(rag, query_text: str, files: list[str], folders: list[str
     return await _filtered_hits(rag, query_text, files, folders, [], top_k)
 
 
+class _UpstreamLLMError(RuntimeError):
+    """上游 LLM 端点**在流里**主动报错（SSE 的 error 事件）。
+
+    典型：llama.cpp 上下文超限时只发一个
+    `data: {"error":{"message":"Context size has been exceeded.","code":500}}`
+    然后收尾 —— 它没有 choices，被当成空增量吞掉（2026-09-15 定位）。
+    """
+
+    def __init__(self, message: str, code: Any = None) -> None:
+        super().__init__(str(message))
+        self.message = str(message)
+        self.code = code
+
+
+# 上游「上下文塞不下」的各种措辞：llama.cpp / vLLM / OpenAI / 各类网关。
+_CONTEXT_OVERFLOW_MARKERS = (
+    "context size has been exceeded",
+    "exceeds the available context size",
+    "context length exceeded",
+    "context_length_exceeded",
+    "maximum context length",
+    "reduce the length of the messages",
+    "prompt is too long",
+    "too many tokens",
+)
+
+
+def _is_context_overflow(exc: BaseException) -> bool:
+    body = f"{exc}".lower()
+    return any(m in body for m in _CONTEXT_OVERFLOW_MARKERS)
+
+
+# 参考资料放不下时值得「收缩重试一次」的 HTTP 状态：请求体过大 / 服务端内部失败。
+_SHRINK_RETRY_STATUS = frozenset({400, 413, 422, 500})
+
+
 async def _chat_stream(prompt: str, system_prompt: str, timeout_s: float = 900.0):
     """OpenAI 兼容接口的流式调用，产出 ("thinking"|"answer", 增量文本)。"""
     llm_cfg = CONFIG["llm"]
-    api_key = os.environ.get("RAG_LLM_API_KEY") or llm_cfg.get("api_key") or ""
+    # 显式配置的 api_key 优先于全局 RAG_LLM_API_KEY：DSH 模型目录里的
+    # 「自定义端点」（如本机 llama.cpp 的 occamy-1.0，--api-key occamy）
+    # 自带密钥，而全局 key 往往是 tokens.store 的——若让全局 key 胜出，
+    # 请求会带着错误的 Bearer 打到自建端点，得到 401。
+    api_key = llm_cfg.get("api_key") or os.environ.get("RAG_LLM_API_KEY") or ""
     url = llm_cfg["base_url"].rstrip("/") + "/chat/completions"
     payload = {
         "model": llm_cfg["model"],
@@ -2487,6 +2531,17 @@ async def _chat_stream(prompt: str, system_prompt: str, timeout_s: float = 900.0
                     chunk = json.loads(data)
                 except Exception:  # noqa: BLE001 - 忽略心跳/非 JSON 行
                     continue
+                # 上游在流中途失败时只发一个 error 事件就收尾（没有 choices）。
+                # 旧代码 `if not delta: continue` 会把它静默吞掉，任务最终以
+                # status=done + 空答案结束 —— 面板上表现为「检索失败但没报错」。
+                err = chunk.get("error")
+                if err:
+                    if isinstance(err, dict):
+                        msg = err.get("message") or err.get("detail") or str(err)
+                        code = err.get("code")
+                    else:
+                        msg, code = err, None
+                    raise _UpstreamLLMError(msg, code)
                 choices = chunk.get("choices") or [{}]
                 delta = choices[0].get("delta") if choices else {}
                 if not delta:
@@ -2540,6 +2595,37 @@ SCOPED_SYSTEM_PROMPT = (
 )
 
 
+# 参考资料超出模型上下文时的收缩档位：(保留条数, 每条截断字符数)。
+# 中文按 ~1.5 字/token 估：8 × 3000 字 ≈ 16k token，一路降到 1 × 300 字 ≈ 0.2k token，
+# 覆盖 ctx 从 16k+ 一直到 ~1k 的小模型（实测 ctx=4096 时只有 4×1000 及以下的档位放得下）。
+_SHRINK_TIERS: tuple[tuple[int, int], ...] = (
+    (8, 3000), (4, 1000), (2, 500), (1, 300),
+)
+
+
+def _build_rag_prompt(hits: list[dict[str, Any]], query_text: str,
+                      max_hits: int | None = None,
+                      per_hit_chars: int | None = None) -> str:
+    """把召回片段拼成「参考资料 + 问题」的 prompt。
+
+    默认 None/None ⇒ 不裁剪，逐字等价于历史行为；收缩重试时传入上限。
+    """
+    selected = hits[:max_hits] if max_hits else hits
+    blocks = []
+    for i, h in enumerate(selected, 1):
+        src = str(h.get("file_path") or "未知来源")
+        body = str(h.get("content") or "")
+        if per_hit_chars:
+            body = body[:per_hit_chars]
+        blocks.append(f"[{i}] 来源：{src}\n{body}")
+    context = "\n\n---\n\n".join(blocks)
+    return (
+        f"参考资料：\n{context}\n\n"
+        f"用户问题：{query_text}\n\n"
+        f"请只依据上述参考资料作答。"
+    )
+
+
 async def _run_scoped_query_op(rag, query_text: str, files: list[str],
                                folders: list[str], set_progress, task: dict[str, Any],
                                q_started: float,
@@ -2583,16 +2669,7 @@ async def _run_scoped_query_op(rag, query_text: str, files: list[str],
         }
         return
 
-    blocks = []
-    for i, h in enumerate(hits, 1):
-        src = str(h.get("file_path") or "未知来源")
-        blocks.append(f"[{i}] 来源：{src}\n{h.get('content') or ''}")
-    context = "\n\n---\n\n".join(blocks)
-    prompt = (
-        f"参考资料：\n{context}\n\n"
-        f"用户问题：{query_text}\n\n"
-        f"请只依据上述参考资料作答。"
-    )
+    prompt = _build_rag_prompt(hits, query_text)
 
     async def _answer_once(sys_prompt: str) -> tuple[str, str]:
         """跑一轮流式生成，返回 (thinking, answer)。
@@ -2620,7 +2697,59 @@ async def _run_scoped_query_op(rag, query_text: str, files: list[str],
                 an = an.replace("<think>", "").strip()
         return th, an
 
-    thinking, answer = await _answer_once(SCOPED_SYSTEM_PROMPT)
+    # ---- 上下文超限自愈（2026-09-15）----------------------------------------
+    # 「召回太猛 → 参考资料塞爆模型上下文」是本地小 ctx 模型上最常见的失败形态。
+    # 上游有两种报法：流里的 error 事件（llama.cpp）或 HTTP 400/413/422/500
+    # （vLLM / 各类网关）。两种都收敛到「按档位收缩参考资料重试」，
+    # 并且**绝不再把空回答当成功返回**。
+    thinking, answer = "", ""
+    need_shrink = False
+    try:
+        thinking, answer = await _answer_once(SCOPED_SYSTEM_PROMPT)
+    except _UpstreamLLMError as exc:
+        if not _is_context_overflow(exc):
+            raise RuntimeError(f"问答失败：上游模型报错 —— {exc}") from exc
+        need_shrink = True
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code not in _SHRINK_RETRY_STATUS:
+            raise
+        need_shrink = True
+
+    # 上游没报错却没吐出答案（流被截断、旧版只回 error 事件、思考跑完没正文）。
+    if not need_shrink and not answer.strip():
+        need_shrink = True
+
+    if need_shrink:
+        last_exc: BaseException | None = None
+        for _keep, _chars in _SHRINK_TIERS:
+            _auto_log(
+                "问答上下文收缩",
+                f"参考资料超出模型上下文，按 {_keep} 条 × {_chars} 字重试 · {query_text[:60]}",
+            )
+            set_progress(
+                "generating",
+                f"参考资料过长，正在收缩到 {_keep} 条后重试…",
+                thinking=thinking, answer=answer,
+            )
+            prompt = _build_rag_prompt(
+                hits, query_text, max_hits=_keep, per_hit_chars=_chars
+            )
+            try:
+                thinking, answer = await _answer_once(SCOPED_SYSTEM_PROMPT)
+            except Exception as exc:  # noqa: BLE001 - 记录后继续降档
+                last_exc = exc
+                continue
+            if answer.strip():
+                break
+        if not answer.strip():
+            detail = f"（最后一次上游报错：{last_exc}）" if last_exc else ""
+            hint = (f" 模型只产出了思考、没有正文：{thinking.strip()[:200]}…"
+                    if thinking.strip() else "")
+            raise RuntimeError(
+                "问答失败：模型没有返回正文答案"
+                f"{detail}{hint} 常见原因是参考资料超出模型上下文 —— "
+                "可缩小 @范围 / 减少知识库正文，或提高模型服务的上下文上限（ctx-size）。"
+            )
 
     # 退化防护（2026-09-13）：本机模型可能在长文档上下文下把回答写成 LightRAG 实体
     # 抽取原文。检测到就用显式纠正指令重跑一次；仍退化则打 degraded 标记，前端据此
@@ -3518,6 +3647,9 @@ async def _run_op(op: str, params: dict[str, Any], task: dict[str, Any]) -> None
             _auto_log("解析失败", f"{label} · {task['error']}")
         elif op == "delete_document":
             _auto_log("删除文档失败", f"{label} · {task['error']}")
+        elif op == "query":
+            # 问答失败以前是「静默空答案」，面板上看不到任何线索；现在显式记一条。
+            _auto_log("知识库问答失败", f"{label} · {task['error']}")
     finally:
         _unregister_processing(task["task_id"])
 
