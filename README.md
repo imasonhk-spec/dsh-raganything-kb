@@ -49,6 +49,7 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 
 | 版本 | 内容 |
 | --- | --- |
+| **0.3.13-sharedkb** | 多用户网关线（8.6）发布件。修复「@ 共享文件 / 文件夹 限定范围问答返回没有检索到」：① `_in_scope` 对 chunk 与 scope 两端对称剥虚拟根（全部文档/ 与 共享/）；② `_route_scope_query` host-aware——宿主本地检索、用户实例把命中共享文件夹的作用域转发宿主 sidecar（17321）并合并回答，单文件不转发自环。见 [`docs/RELEASE-0.3.13-sharedkb.md`](docs/RELEASE-0.3.13-sharedkb.md) |
 | **0.3.12-sharedkb** | 多用户网关线（8.6）发布件。「对话产物 → 打开原始文件」修复：`/documents/{art-<id>}/content` 由恒 404 改为 200（office 型返回空正文 + `file_path`，交前端 OFV 渲染）；顺带清掉 0.3.11 包内误带的 `.bak`。见 [`docs/RELEASE-0.3.12-sharedkb.md`](docs/RELEASE-0.3.12-sharedkb.md) |
 | **0.3.10** | ABCD 加固 + 多用户本地模型 SSL 彻底修复：`server.py` 本地端点自适应（选本地模型不再报 `CERTIFICATE_VERIFY_FAILED`）、`/models/restart` 端口竞态修复；`client.js` 退化答案检测 + `degraded` 透传（不再把退化回答写成「知识库产物」）；10 份 `config.json` 归一化到 `127.0.0.1:11434/v1`；问答模型切 `qwen3.6:35b-chat` |
 | 0.3.9 | 「索引」弹窗计数口径修复：`extDist` 遍历 `kbDocs` 而非全部 `docs`，弹窗数字与侧栏状态栏、目录树三者一致（此前状态栏 9、弹窗 455） |
@@ -57,7 +58,8 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 | 0.3.6 | 多用户数据隔离；「删除后重传仍报重复」修复（A–G 七处）；`install.sh --no-pnpm` 解析器修复 |
 | 0.3.5 | 基线 |
 
-发布说明见 [`docs/RELEASE-0.3.12-sharedkb.md`](docs/RELEASE-0.3.12-sharedkb.md)（sharedkb 线）、
+发布说明见 [`docs/RELEASE-0.3.13-sharedkb.md`](docs/RELEASE-0.3.13-sharedkb.md)（sharedkb 线最新）、
+[`docs/RELEASE-0.3.12-sharedkb.md`](docs/RELEASE-0.3.12-sharedkb.md)（sharedkb 线）、
 [`docs/RELEASE-0.3.10.md`](docs/RELEASE-0.3.10.md)（主 line；历史：[0.3.9](docs/RELEASE-0.3.9.md) · [0.3.8](docs/RELEASE-0.3.8.md) · [0.3.7](docs/RELEASE-0.3.7.md)）、
 [`docs/RELEASE-shared-kb.md`](docs/RELEASE-shared-kb.md)。
 
@@ -66,8 +68,8 @@ DeepSeek Harness (DSH) 的「AI 知识库」插件 —— 一个包 = **宿主�
 可移植包由 `packaging/`（安装器 + 载荷 + 校验清单）与 `src/`（插件源码）组装，`plugin/` 内为 `dsh plugin add` 用的插件包（由 [`build/pack_kb.py`](build/pack_kb.py) 确定性打包）：
 
 ```bash
-tar xzf dsh-raganything-kb-0.3.12-sharedkb-portable.tar.gz
-cd dsh-raganything-kb-0.3.12-sharedkb-portable
+tar xzf dsh-raganything-kb-0.3.13-sharedkb-portable.tar.gz
+cd dsh-raganything-kb-0.3.13-sharedkb-portable
 SUDO_PW='<sudo 密码>' ./install.sh --profile web   # 以 DSH 属主用户运行，不要用 root
 ./verify.sh --profile web --deep                   # --deep 会真的提交一次查询验证整条链路
 ```
@@ -80,7 +82,7 @@ SUDO_PW='<sudo 密码>' ./install.sh --profile web   # 以 DSH 属主用户运�
 > `pkill -f "python.*server.py"`，在 8.6 这类多用户宿主上会连带杀掉宿主 sidecar 和其他用户的
 > 懒加载实例 —— 详见 [发布说明](docs/RELEASE-0.3.12-sharedkb.md)。
 
-发布件同时归档在 `releases/0.3.12-sharedkb/`（`.tgz` + `-portable.tar.gz` + `CHECKSUMS.md`）。
+发布件同时归档在 `releases/0.3.13-sharedkb/`（`.tgz` + `-portable.tar.gz` + `CHECKSUMS.md`）。
 
 ---
 
