@@ -2383,10 +2383,24 @@ def _strip_ext(path: str) -> str:
     return f"{head}{sep}{base}"
 
 
+_VROOT_PREFIXES = ("全部文档/", "共享/")
+
+
+def _strip_vroot(path: str) -> str:
+    """剥掉虚拟根前缀（全部文档/ 与 共享/ 等）。"""
+    p = str(path or "").replace("\\", "/").strip()
+    for _pre in _VROOT_PREFIXES:
+        if p.startswith(_pre):
+            return p[len(_pre):]
+    return p
+
+
 def _in_scope(file_path: Any, files: list[str], folders: list[str]) -> bool:
     """file_path 是否落在指定作用域内。空作用域 == 全库。
 
-    匹配顺序：先全等（最严格），再去扩展名后比较（兼容 UI chip）。
+    匹配顺序：先全等（最严格），再去扩展名后比较（兼容 UI chip），
+    再对称剥虚拟根（全部文档/ 与 共享/）——兼容「chunk 带前缀、scope 不带」
+    与「scope 带前缀、chunk 不带」两种方向，避免共享文件 @范围检索落空。
     """
     if not files and not folders:
         return True
@@ -2394,11 +2408,19 @@ def _in_scope(file_path: Any, files: list[str], folders: list[str]) -> bool:
     if not fp:
         return False
     nfp = _strip_ext(fp)
+    # 两端都剥虚拟根：共享 chunk 的 file_path 带「共享/」，前端 @ scope 不带；
+    # 全库根级文件 UI 拼成「全部文档/<名>」而 chunk 只有「<名>」。
+    fp0 = _strip_vroot(fp)
+    nfp0 = _strip_ext(fp0)
     for f in files:
-        if fp == f or nfp == _strip_ext(f):
+        f0 = _strip_vroot(f)
+        nf0 = _strip_ext(f0)
+        if fp == f or nfp == nf0 or fp0 == f0 or nfp0 == nf0:
             return True
     for d in folders:
-        if fp == d or fp.startswith(d + "/") or nfp == d or nfp.startswith(d + "/"):
+        d0 = _strip_vroot(d)
+        if (fp == d or fp.startswith(d + "/") or nfp == d or nfp.startswith(d + "/")
+                or fp0 == d0 or fp0.startswith(d0 + "/") or nfp0 == d0 or nfp0.startswith(d0 + "/")):
             return True
     return False
 
@@ -2778,6 +2800,133 @@ async def _run_scoped_query_op(rag, query_text: str, files: list[str],
         "degraded": degraded,
         "elapsed": round(time.time() - q_started, 1),
     }
+
+
+# ---------------------------------------------------------------------------
+# @共享作用域转发（2026-09-16）
+#
+# 多用户部署里共享 chunk 只在宿主实例（SHARED_BASE）入库，用户实例的 rag 只持
+# 私有库（file_path 无「共享/」前缀）。前端 @ 共享文件时 scope 不带「共享/」，
+# 用户实例本地检索永远 0 命中。这里把命中共享文件夹的作用域拆分出来转发宿主检索，
+# 私有部分仍本地检索，最后合并。宿主实例本地已持共享库本体，直接本地检索即可。
+# ---------------------------------------------------------------------------
+
+def _shared_folder_names() -> set[str]:
+    """共享文件夹名集合（来自 shared_kb.json 的 folders[].name）。"""
+    try:
+        folders = (_shared_manifest().get("folders") or [])
+    except Exception:
+        folders = []
+    names: set[str] = set()
+    for f in folders:
+        if isinstance(f, dict) and f.get("name"):
+            names.add(str(f["name"]))
+        elif isinstance(f, str) and f:
+            names.add(f)
+    return names
+
+
+def _split_shared_scope(files: list[str], folders: list[str]) -> tuple[list[str], list[str], list[str], list[str]]:
+    names = _shared_folder_names()
+    if not names:
+        return [], [], list(files), list(folders)
+
+    def _top(p: str) -> str:
+        return str(p).replace("\\", "/").strip("/").split("/", 1)[0]
+
+    def _iss(p: str) -> bool:
+        return _top(p) in names
+
+    sf = [f for f in files if _iss(f)]
+    sfold = [d for d in folders if _iss(d)]
+    pf = [f for f in files if not _iss(f)]
+    pfold = [d for d in folders if not _iss(d)]
+    return sf, sfold, pf, pfold
+
+
+def _shared_auth_headers() -> dict[str, str]:
+    tok = _shared_token()
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
+async def _forward_shared_scope_query(query_text: str, shared_files: list[str],
+                                      shared_folders: list[str], set_progress,
+                                      q_started: float) -> dict[str, Any]:
+    scope = {
+        "files": [SHARED_NS + "/" + f for f in shared_files],
+        "folders": [SHARED_NS + "/" + d for d in shared_folders],
+    }
+    payload = {"op": "query", "params": {"query": query_text, "scope": scope, "mode": "hybrid"}}
+    set_progress("retrieval", "正在检索共享知识库（转发至宿主实例）…")
+    created = await _shared_forward("POST", "/tasks", json_body=payload)
+    tid = (created or {}).get("task_id")
+    if not tid:
+        raise RuntimeError("宿主实例未返回 task_id（共享作用域转发失败）")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(900.0, connect=10.0)) as cli:
+        while True:
+            await asyncio.sleep(1.5)
+            st = await cli.get(SHARED_BASE + "/tasks/" + tid, headers=_shared_auth_headers())
+            st.raise_for_status()
+            data = st.json() or {}
+            if data.get("status") == "done":
+                return data.get("result") or {}
+            if data.get("status") == "error":
+                raise RuntimeError(str(data.get("error") or "宿主实例检索失败"))
+            prog = data.get("progress") or {}
+            if isinstance(prog, dict) and prog.get("stage"):
+                set_progress(prog.get("stage"), prog.get("message", ""),
+                             thinking=prog.get("thinking", ""), answer=prog.get("answer", ""))
+
+
+def _merge_scope_results(shared_res: dict, priv_res: dict) -> dict[str, Any]:
+    shared_res = shared_res or {}
+    priv_res = priv_res or {}
+    secs: list[str] = []
+    if shared_res.get("answer"):
+        secs.append("【共享知识库】\n" + shared_res.get("answer", ""))
+    if priv_res.get("answer"):
+        secs.append("【私有知识库】\n" + priv_res.get("answer", ""))
+    answer = "\n\n".join(s for s in secs if s).strip()
+    if not answer:
+        answer = shared_res.get("answer") or priv_res.get("answer") or "没有检索到与该问题相关的内容。"
+    return {
+        "answer": answer,
+        "thinking": shared_res.get("thinking", "") or priv_res.get("thinking", ""),
+        "mode": "scope",
+        "scope": {},
+        "excluded": [],
+        "hits": (shared_res.get("hits") or 0) + (priv_res.get("hits") or 0),
+        "sources": ((shared_res.get("sources") or []) + (priv_res.get("sources") or []))[:10],
+        "degraded": bool(shared_res.get("degraded") or priv_res.get("degraded")),
+        "elapsed": 0,
+    }
+
+
+async def _route_scope_query(rag, query_text: str, scope_files: list[str], scope_folders: list[str],
+                             set_progress, task: dict[str, Any], q_started: float) -> None:
+    sf, sfold, pf, pfold = _split_shared_scope(scope_files, scope_folders)
+    if not (sf or sfold):
+        # 纯私有作用域：直接本地检索
+        await _run_scoped_query_op(rag, query_text, scope_files, scope_folders, set_progress, task, q_started)
+        return
+    if _shared_is_local():
+        # 本实例即宿主，本地已持共享库本体，无需转发
+        await _run_scoped_query_op(rag, query_text, scope_files, scope_folders, set_progress, task, q_started)
+        return
+    if not (pf or pfold):
+        # 纯共享作用域：转发宿主检索
+        res = await _forward_shared_scope_query(query_text, sf, sfold, set_progress, q_started)
+        task["result"] = res
+        set_progress("done", "回答完成", thinking=res.get("thinking", ""), answer=res.get("answer", ""))
+        return
+    # 混合：共享部分转发宿主 + 私有部分本地检索，合并回答
+    await _run_scoped_query_op(rag, query_text, pf, pfold, set_progress, task, q_started)
+    priv_res = task.get("result") or {}
+    shared_res = await _forward_shared_scope_query(query_text, sf, sfold, set_progress, q_started)
+    task["result"] = _merge_scope_results(shared_res, priv_res)
+    set_progress("done", "回答完成",
+                 thinking=(shared_res or {}).get("thinking", "") or (priv_res or {}).get("thinking", ""),
+                 answer=task["result"].get("answer", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -3315,7 +3464,7 @@ async def _run_query_op(params: dict[str, Any], task: dict[str, Any]) -> None:
                 "知识库问答(限定范围)",
                 f"{_scope_desc(_scope_files, _scope_folders)} · {params['query'][:120]}",
             )
-            await _run_scoped_query_op(
+            await _route_scope_query(
                 rag, query_text, _scope_files, _scope_folders,
                 set_progress, task, q_started,
             )
